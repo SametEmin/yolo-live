@@ -324,6 +324,10 @@ struct LiveRecording {
     frame_count: u64,
     /// Estimated capture FPS for ffmpeg (from client or EMA).
     fps: f32,
+    /// True once we have seen a non-black frame (avoids leading black in export).
+    content_started: bool,
+    /// Consecutive non-black frames seen (require a couple before recording).
+    good_streak: u32,
 }
 
 async fn handle_live_ws(socket: WebSocket, state: AppState) {
@@ -338,6 +342,8 @@ async fn handle_live_ws(socket: WebSocket, state: AppState) {
         frames_dir,
         frame_count: 0,
         fps: 12.0,
+        content_started: false,
+        good_streak: 0,
     };
     let mut recording_active = true;
 
@@ -421,15 +427,33 @@ async fn handle_live_ws(socket: WebSocket, state: AppState) {
                 match result {
                     Ok(Ok((jpeg, meta))) => {
                         if recording_active {
-                            recording.frame_count += 1;
-                            if meta.fps > 1.0 {
-                                // Blend reported end-to-end fps for export framerate
-                                recording.fps = 0.8 * recording.fps + 0.2 * meta.fps.max(5.0);
+                            // Skip leading black / empty camera frames so the exported
+                            // video does not open on a black screen.
+                            let black = jpeg_is_mostly_black(&jpeg);
+                            if black {
+                                recording.good_streak = 0;
+                            } else {
+                                recording.good_streak = recording.good_streak.saturating_add(1);
                             }
-                            let fp = recording
-                                .frames_dir
-                                .join(format!("frame_{:06}.jpg", recording.frame_count));
-                            let _ = std::fs::write(&fp, &jpeg);
+
+                            // Require 2 consecutive non-black frames before first write.
+                            if !recording.content_started {
+                                if recording.good_streak >= 2 {
+                                    recording.content_started = true;
+                                }
+                            }
+
+                            if recording.content_started && !black {
+                                recording.frame_count += 1;
+                                if meta.fps > 1.0 {
+                                    recording.fps =
+                                        0.8 * recording.fps + 0.2 * meta.fps.max(5.0);
+                                }
+                                let fp = recording
+                                    .frames_dir
+                                    .join(format!("frame_{:06}.jpg", recording.frame_count));
+                                let _ = std::fs::write(&fp, &jpeg);
+                            }
                         }
 
                         let frame = format!("data:image/jpeg;base64,{}", B64.encode(&jpeg));
@@ -442,7 +466,7 @@ async fn handle_live_ws(socket: WebSocket, state: AppState) {
                             "inference_ms": meta.inference_ms,
                             "device": meta.device,
                             "count": meta.count,
-                            "recording": recording_active,
+                            "recording": recording_active && recording.content_started,
                             "recorded_frames": recording.frame_count,
                         });
                         if sender
@@ -500,16 +524,24 @@ async fn finalize_live_recording(state: &AppState, rec: &LiveRecording) -> Optio
         .root
         .join("outputs")
         .join(format!("{}_annotated.mp4", rec.job_id));
-    let pattern = rec.frames_dir.join("frame_%06d.jpg");
     let fps = rec.fps.clamp(5.0, 30.0);
-
     let job_id = rec.job_id.clone();
     let frames_dir = rec.frames_dir.clone();
     let out_clone = out_video.clone();
-    let pattern_s = pattern.to_string_lossy().to_string();
-    let out_s = out_video.to_string_lossy().to_string();
 
     let ok = tokio::task::spawn_blocking(move || {
+        // Re-pack frames into a tight sequential list, dropping any remaining
+        // leading black frames (safety net if a few slipped through).
+        let packed = match pack_live_frames(&frames_dir) {
+            Ok(n) if n > 0 => n,
+            _ => return false,
+        };
+        let pattern = frames_dir.join("frame_%06d.jpg");
+        let pattern_s = pattern.to_string_lossy().to_string();
+        let out_s = out_clone.to_string_lossy().to_string();
+
+        // -framerate on input sets presentation timestamps; -r on output stabilizes playback.
+        // scale forces even dims for yuv420p; bf=0 avoids odd leading GOP black flashes in some players.
         let status = Command::new("ffmpeg")
             .args([
                 "-y",
@@ -518,19 +550,31 @@ async fn finalize_live_recording(state: &AppState, rec: &LiveRecording) -> Optio
                 "error",
                 "-framerate",
                 &format!("{fps:.2}"),
+                "-start_number",
+                "1",
                 "-i",
                 &pattern_s,
+                "-vf",
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
                 "-c:v",
                 "libx264",
+                "-preset",
+                "veryfast",
+                "-bf",
+                "0",
                 "-pix_fmt",
                 "yuv420p",
                 "-movflags",
                 "+faststart",
+                "-r",
+                &format!("{fps:.2}"),
                 &out_s,
             ])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
+
+        let _ = packed; // used for validation above
         let _ = std::fs::remove_dir_all(&frames_dir);
         status && out_clone.exists()
     })
@@ -549,6 +593,104 @@ async fn finalize_live_recording(state: &AppState, rec: &LiveRecording) -> Optio
         error!("Failed to assemble live annotated video for {job_id}");
         None
     }
+}
+
+/// True if JPEG is empty/black (camera still warming up).
+fn jpeg_is_mostly_black(jpeg: &[u8]) -> bool {
+    let Ok(img) = image::load_from_memory(jpeg) else {
+        return true;
+    };
+    let rgb = img.to_rgb8();
+    let (w, h) = rgb.dimensions();
+    if w == 0 || h == 0 {
+        return true;
+    }
+    // Sample a grid of pixels for speed.
+    let step_x = (w / 32).max(1);
+    let step_y = (h / 32).max(1);
+    let mut sum: u64 = 0;
+    let mut n: u64 = 0;
+    let mut y = 0u32;
+    while y < h {
+        let mut x = 0u32;
+        while x < w {
+            let p = rgb.get_pixel(x, y).0;
+            // Rec. 601 luma approximation
+            let yv = (77u32 * p[0] as u32 + 150u32 * p[1] as u32 + 29u32 * p[2] as u32) >> 8;
+            sum += yv as u64;
+            n += 1;
+            x = x.saturating_add(step_x);
+        }
+        y = y.saturating_add(step_y);
+    }
+    if n == 0 {
+        return true;
+    }
+    let mean = sum as f64 / n as f64;
+    mean < 14.0
+}
+
+/// Ensure frames are contiguous frame_000001.jpg … and drop leading black ones.
+fn pack_live_frames(frames_dir: &Path) -> std::io::Result<u64> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(frames_dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("jpg"))
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        return Ok(0);
+    }
+
+    // Drop leading black frames
+    while let Some(first) = files.first() {
+        let Ok(bytes) = std::fs::read(first) else {
+            files.remove(0);
+            continue;
+        };
+        if jpeg_is_mostly_black(&bytes) {
+            let _ = std::fs::remove_file(first);
+            files.remove(0);
+        } else {
+            break;
+        }
+    }
+    if files.is_empty() {
+        return Ok(0);
+    }
+
+    // Move into temp names first to avoid clobbering, then rename to frame_%06d.jpg
+    let tmp_dir = frames_dir.join("_pack");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir)?;
+    for (i, src) in files.iter().enumerate() {
+        let dst = tmp_dir.join(format!("frame_{:06}.jpg", i + 1));
+        std::fs::rename(src, &dst).or_else(|_| {
+            std::fs::copy(src, &dst).map(|_| {
+                let _ = std::fs::remove_file(src);
+            })
+        })?;
+    }
+    // Clear remaining originals
+    for e in std::fs::read_dir(frames_dir)?.flatten() {
+        let p = e.path();
+        if p.file_name().and_then(|n| n.to_str()) == Some("_pack") {
+            continue;
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+    for e in std::fs::read_dir(&tmp_dir)?.flatten() {
+        let src = e.path();
+        let name = src.file_name().unwrap().to_owned();
+        std::fs::rename(&src, frames_dir.join(name))?;
+    }
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    Ok(files.len() as u64)
 }
 
 async fn ws_video_upgrade(

@@ -10,6 +10,7 @@
     confSlider: $("confSlider"),
     confValue: $("confValue"),
     webcam: $("webcam"),
+    previewVideo: $("previewVideo"),
     captureCanvas: $("captureCanvas"),
     outputFrame: $("outputFrame"),
     placeholder: $("placeholder"),
@@ -46,6 +47,8 @@
     loopId: null,
     jobId: null,
     selectedFile: null,
+    previewObjectUrl: null,
+    liveWarmupLeft: 0,
     busyFrame: false,
     stopping: false,
     expectedFrames: 0,
@@ -77,6 +80,7 @@
     els.progressBar.hidden = true;
     hideDownload();
     setRecordingUi(false, 0);
+    if (mode !== "upload") clearPreviewVideo();
     updateControlVisibility();
     if (mode === "live") {
       els.placeholderTitle.textContent = "Live camera mode";
@@ -128,6 +132,7 @@
     state.selectedFile = f || null;
     els.fileName.textContent = f ? f.name : "No file selected";
     hideDownload();
+    showSelectedVideoPreview(f || null);
   });
   els.btnStart.addEventListener("click", () =>
     state.mode === "live" ? startLive() : startUpload()
@@ -166,8 +171,46 @@
   }
   function showFrame(dataUrl) {
     els.placeholder.hidden = true;
+    if (els.previewVideo) {
+      els.previewVideo.hidden = true;
+      els.previewVideo.pause();
+    }
     els.outputFrame.hidden = false;
     els.outputFrame.src = dataUrl;
+  }
+
+  function clearPreviewVideo() {
+    if (!els.previewVideo) return;
+    els.previewVideo.pause();
+    els.previewVideo.removeAttribute("src");
+    els.previewVideo.load();
+    els.previewVideo.hidden = true;
+    if (state.previewObjectUrl) {
+      URL.revokeObjectURL(state.previewObjectUrl);
+      state.previewObjectUrl = null;
+    }
+  }
+
+  function showSelectedVideoPreview(file) {
+    if (!els.previewVideo) return;
+    clearPreviewVideo();
+    if (!file) {
+      if (state.mode === "upload") showPlaceholder(true);
+      return;
+    }
+    // Show the chosen file on the stage before detection starts.
+    const url = URL.createObjectURL(file);
+    state.previewObjectUrl = url;
+    els.previewVideo.src = url;
+    els.previewVideo.hidden = false;
+    els.outputFrame.hidden = true;
+    els.outputFrame.removeAttribute("src");
+    els.placeholder.hidden = true;
+    els.previewVideo.currentTime = 0;
+    els.previewVideo.play().catch(() => {
+      // Autoplay may be blocked; controls are available for manual play.
+    });
+    els.statusText.textContent = `Selected: ${file.name}`;
   }
 
   function hideDownload() {
@@ -373,7 +416,9 @@
           JSON.stringify({ type: "config", confidence: Number(els.confSlider.value) / 100 })
         );
         setRunningFlags({ running: true });
-        els.statusText.textContent = "Live detection · recording annotated video";
+        // Drop first frames so the export does not begin on a black camera warm-up.
+        state.liveWarmupLeft = 10;
+        els.statusText.textContent = "Live detection · waiting for camera…";
         showPlaceholder(false);
         setRecordingUi(true, 0);
         pumpLiveFrames();
@@ -423,13 +468,51 @@
         return;
       if (!state.busyFrame) {
         const video = els.webcam;
-        if (video.readyState >= 2) {
+        // Wait until the browser has real camera pixels (not a black 0×0 surface).
+        if (
+          video.readyState >= 2 &&
+          video.videoWidth >= 16 &&
+          video.videoHeight >= 16 &&
+          !video.paused
+        ) {
+          if (state.liveWarmupLeft > 0) {
+            state.liveWarmupLeft -= 1;
+            // Still draw so the UI can update via detection after warmup.
+            if (state.liveWarmupLeft > 0) {
+              state.loopId = requestAnimationFrame(tick);
+              return;
+            }
+            els.statusText.textContent = "Live detection · recording annotated video";
+          }
           const canvas = els.captureCanvas;
           const maxW = 960;
-          const scale = Math.min(1, maxW / (video.videoWidth || maxW));
-          canvas.width = Math.round((video.videoWidth || 640) * scale);
-          canvas.height = Math.round((video.videoHeight || 480) * scale);
-          canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+          const scale = Math.min(1, maxW / video.videoWidth);
+          canvas.width = Math.round(video.videoWidth * scale);
+          canvas.height = Math.round(video.videoHeight * scale);
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          // Client-side black check: skip nearly black frames until content appears.
+          try {
+            const sample = ctx.getImageData(
+              Math.floor(canvas.width / 4),
+              Math.floor(canvas.height / 4),
+              Math.max(1, Math.floor(canvas.width / 2)),
+              Math.max(1, Math.floor(canvas.height / 2))
+            ).data;
+            let sum = 0;
+            let n = 0;
+            for (let i = 0; i < sample.length; i += 32) {
+              sum += sample[i] + sample[i + 1] + sample[i + 2];
+              n += 3;
+            }
+            const mean = n ? sum / n : 0;
+            if (mean < 12) {
+              state.loopId = requestAnimationFrame(tick);
+              return;
+            }
+          } catch (_) {
+            /* getImageData may fail if canvas is tainted — ignore */
+          }
           state.busyFrame = true;
           state.ws.send(
             JSON.stringify({ type: "frame", frame: canvas.toDataURL("image/jpeg", 0.72) })
@@ -453,6 +536,10 @@
       state.expectedFrames = 0;
       state.processed = 0;
       state._downloadAfterExport = false;
+      // Keep the selected video visible on stage while uploading / until first annotated frame.
+      if (state.selectedFile && els.previewVideo && !state.previewObjectUrl) {
+        showSelectedVideoPreview(state.selectedFile);
+      }
       els.statusText.textContent = "Uploading video…";
       els.progressBar.hidden = false;
       els.progressFill.style.width = "0%";
