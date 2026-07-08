@@ -248,3 +248,48 @@ body {
 .summary-list::-webkit-scrollbar-thumb, .instance-list::-webkit-scrollbar-thumb {
   background: rgba(255,255,255,0.12); border-radius: 99px;
 }
+
+.bottom-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-top: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.bottom-bar .upload-zone {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0;
+  border: none;
+  flex: 1;
+  flex-wrap: wrap;
+}
+.live-status {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.record-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: rgba(255, 92, 122, 0.12);
+  border: 1px solid rgba(255, 92, 122, 0.35);
+  color: #ff8fa3;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+.record-pill .rec-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ff5c7a;
+  box-shadow: 0 0 0 3px rgba(255, 92, 122, 0.25);
+  animation: pulse 1.2s ease infinite;
+}

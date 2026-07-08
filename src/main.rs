@@ -297,8 +297,40 @@ async fn ws_detect_upgrade(
     ws.on_upgrade(move |socket| handle_live_ws(socket, state))
 }
 
+struct LiveRecording {
+    job_id: String,
+    frames_dir: PathBuf,
+    frame_count: u64,
+    /// Estimated capture FPS for ffmpeg (from client or EMA).
+    fps: f32,
+}
+
 async fn handle_live_ws(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
+
+    // Auto-record live session so user can download annotated video on stop.
+    let job_id = Uuid::new_v4().simple().to_string()[..12].to_string();
+    let frames_dir = state.root.join("outputs").join(format!("{job_id}_live_frames"));
+    let _ = std::fs::create_dir_all(&frames_dir);
+    let mut recording = LiveRecording {
+        job_id: job_id.clone(),
+        frames_dir,
+        frame_count: 0,
+        fps: 12.0,
+    };
+    let mut recording_active = true;
+
+    let _ = sender
+        .send(Message::Text(
+            json!({
+                "type": "recording_started",
+                "job_id": recording.job_id,
+                "message": "Recording annotated live frames"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await;
 
     while let Some(Ok(msg)) = receiver.next().await {
         let text = match msg {
@@ -329,14 +361,31 @@ async fn handle_live_ws(socket: WebSocket, state: AppState) {
                     ))
                     .await;
             }
+            Some("stop") | Some("record_stop") => {
+                // Finalize annotated MP4 and notify client before socket ends.
+                if recording_active {
+                    let out = finalize_live_recording(&state, &recording).await;
+                    let _ = sender
+                        .send(Message::Text(
+                            json!({
+                                "type": "recording_ready",
+                                "job_id": recording.job_id,
+                                "frames": recording.frame_count,
+                                "output": out,
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await;
+                    recording_active = false;
+                }
+                break;
+            }
             Some("frame") | None => {
                 let Some(b64) = v.get("frame").and_then(|f| f.as_str()) else {
                     continue;
                 };
-                let b64 = b64
-                    .split_once(',')
-                    .map(|(_, d)| d)
-                    .unwrap_or(b64);
+                let b64 = b64.split_once(',').map(|(_, d)| d).unwrap_or(b64);
                 let Ok(raw) = B64.decode(b64) else {
                     continue;
                 };
@@ -350,6 +399,18 @@ async fn handle_live_ws(socket: WebSocket, state: AppState) {
 
                 match result {
                     Ok(Ok((jpeg, meta))) => {
+                        if recording_active {
+                            recording.frame_count += 1;
+                            if meta.fps > 1.0 {
+                                // Blend reported end-to-end fps for export framerate
+                                recording.fps = 0.8 * recording.fps + 0.2 * meta.fps.max(5.0);
+                            }
+                            let fp = recording
+                                .frames_dir
+                                .join(format!("frame_{:06}.jpg", recording.frame_count));
+                            let _ = std::fs::write(&fp, &jpeg);
+                        }
+
                         let frame = format!("data:image/jpeg;base64,{}", B64.encode(&jpeg));
                         let payload = json!({
                             "type": "result",
@@ -359,7 +420,9 @@ async fn handle_live_ws(socket: WebSocket, state: AppState) {
                             "fps": meta.fps,
                             "inference_ms": meta.inference_ms,
                             "device": meta.device,
-                            "count": meta.count
+                            "count": meta.count,
+                            "recording": recording_active,
+                            "recorded_frames": recording.frame_count,
                         });
                         if sender
                             .send(Message::Text(payload.to_string().into()))
@@ -384,6 +447,86 @@ async fn handle_live_ws(socket: WebSocket, state: AppState) {
             }
             _ => {}
         }
+    }
+
+    // If client disconnected without stop, still try to finalize.
+    if recording_active && recording.frame_count > 0 {
+        let out = finalize_live_recording(&state, &recording).await;
+        let _ = sender
+            .send(Message::Text(
+                json!({
+                    "type": "recording_ready",
+                    "job_id": recording.job_id,
+                    "frames": recording.frame_count,
+                    "output": out,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await;
+    } else if recording.frame_count == 0 {
+        let _ = std::fs::remove_dir_all(&recording.frames_dir);
+    }
+}
+
+async fn finalize_live_recording(state: &AppState, rec: &LiveRecording) -> Option<String> {
+    if rec.frame_count == 0 {
+        let _ = std::fs::remove_dir_all(&rec.frames_dir);
+        return None;
+    }
+
+    let out_video = state
+        .root
+        .join("outputs")
+        .join(format!("{}_annotated.mp4", rec.job_id));
+    let pattern = rec.frames_dir.join("frame_%06d.jpg");
+    let fps = rec.fps.clamp(5.0, 30.0);
+
+    let job_id = rec.job_id.clone();
+    let frames_dir = rec.frames_dir.clone();
+    let out_clone = out_video.clone();
+    let pattern_s = pattern.to_string_lossy().to_string();
+    let out_s = out_video.to_string_lossy().to_string();
+
+    let ok = tokio::task::spawn_blocking(move || {
+        let status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-framerate",
+                &format!("{fps:.2}"),
+                "-i",
+                &pattern_s,
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                &out_s,
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let _ = std::fs::remove_dir_all(&frames_dir);
+        status && out_clone.exists()
+    })
+    .await
+    .unwrap_or(false);
+
+    if ok {
+        info!(
+            "Live annotated video ready: {} ({} frames @ {:.1} fps)",
+            out_video.display(),
+            rec.frame_count,
+            fps
+        );
+        Some(format!("/api/download/{job_id}"))
+    } else {
+        error!("Failed to assemble live annotated video for {job_id}");
+        None
     }
 }
 

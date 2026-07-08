@@ -67,7 +67,7 @@
               <span class="mono" id="confValue">0.35</span>
             </label>
             <button class="btn primary" id="btnStart">Start</button>
-            <button class="btn ghost" id="btnStop" disabled>Stop</button>
+            <button class="btn ghost" id="btnStop" disabled>Stop &amp; save</button>
           </div>
         </div>
 
@@ -92,11 +92,19 @@
           </div>
         </div>
 
-        <div class="upload-zone" id="uploadZone" hidden>
-          <input type="file" id="fileInput" accept="video/mp4,video/quicktime,video/webm,video/x-msvideo,.mp4,.mov,.webm,.avi,.mkv,.m4v" hidden />
-          <button class="btn secondary" id="btnPickFile">Choose video file</button>
-          <span class="file-name" id="fileName">No file selected</span>
-          <a class="download-link" id="downloadLink" hidden href="#">Download annotated video</a>
+        <div class="bottom-bar">
+          <div class="upload-zone" id="uploadZone" hidden>
+            <input type="file" id="fileInput" accept="video/mp4,video/quicktime,video/webm,video/x-msvideo,.mp4,.mov,.webm,.avi,.mkv,.m4v" hidden />
+            <button class="btn secondary" id="btnPickFile">Choose video file</button>
+            <span class="file-name" id="fileName">No file selected</span>
+          </div>
+          <div class="live-status" id="liveStatus">
+            <span class="record-pill" id="recordPill" hidden>
+              <span class="rec-dot"></span>
+              REC <span class="mono" id="recFrames">0</span> frames
+            </span>
+            <a class="download-link" id="downloadLink" hidden href="#" download>Download annotated video</a>
+          </div>
         </div>
       </section>
 

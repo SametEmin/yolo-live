@@ -11,8 +11,19 @@
     infValue: $("infValue"), objValue: $("objValue"), deviceLabel: $("deviceLabel"),
     deviceChip: $("deviceChip"), statusText: $("statusText"), progressBar: $("progressBar"),
     progressFill: $("progressFill"), progressLabel: $("progressLabel"),
+    recordPill: $("recordPill"), recFrames: $("recFrames"),
   };
-  const state = { mode: "live", running: false, ws: null, stream: null, loopId: null, jobId: null, selectedFile: null, busyFrame: false };
+  const state = {
+    mode: "live",
+    running: false,
+    ws: null,
+    stream: null,
+    loopId: null,
+    jobId: null,
+    selectedFile: null,
+    busyFrame: false,
+    stopping: false,
+  };
 
   fetch("/api/health").then(r => r.json()).then(d => {
     const dev = (d.device || "cpu").toLowerCase();
@@ -28,15 +39,20 @@
     els.btnUpload.classList.toggle("active", mode === "upload");
     els.uploadZone.hidden = mode !== "upload";
     els.progressBar.hidden = true;
-    els.downloadLink.hidden = true;
+    hideDownload();
+    setRecordingUi(false, 0);
     if (mode === "live") {
       els.placeholderTitle.textContent = "Live camera mode";
-      els.placeholderText.innerHTML = "Click <strong>Start</strong> to open your webcam. Inference runs in <strong>Rust + CoreML</strong>.";
+      els.placeholderText.innerHTML =
+        "Click <strong>Start</strong> to open your webcam. Annotated frames are recorded automatically — press <strong>Stop &amp; save</strong> to download the video.";
       els.btnStart.textContent = "Start camera";
+      els.btnStop.textContent = "Stop & save";
     } else {
       els.placeholderTitle.textContent = "Upload a video";
-      els.placeholderText.innerHTML = "Choose a video file, then click <strong>Start</strong> to run YOLO frame by frame.";
+      els.placeholderText.innerHTML =
+        "Choose a video file, then click <strong>Start</strong> to run YOLO frame by frame.";
       els.btnStart.textContent = "Start detection";
+      els.btnStop.textContent = "Stop";
     }
     showPlaceholder(true);
   }
@@ -53,7 +69,7 @@
     const f = els.fileInput.files?.[0];
     state.selectedFile = f || null;
     els.fileName.textContent = f ? f.name : "No file selected";
-    els.downloadLink.hidden = true;
+    hideDownload();
   });
   els.btnStart.addEventListener("click", () => state.mode === "live" ? startLive() : startUpload());
   els.btnStop.addEventListener("click", () => stopAll());
@@ -75,6 +91,21 @@
     els.outputFrame.hidden = false;
     els.outputFrame.src = dataUrl;
   }
+  function hideDownload() {
+    els.downloadLink.hidden = true;
+    els.downloadLink.removeAttribute("href");
+  }
+  function showDownload(url) {
+    if (!url) return;
+    els.downloadLink.hidden = false;
+    els.downloadLink.href = url;
+    els.downloadLink.setAttribute("download", "");
+  }
+  function setRecordingUi(on, frames) {
+    if (!els.recordPill) return;
+    els.recordPill.hidden = !on;
+    if (els.recFrames) els.recFrames.textContent = String(frames || 0);
+  }
   function escapeHtml(s) {
     return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
   }
@@ -85,6 +116,9 @@
     if (data.device) {
       const d = String(data.device).toLowerCase();
       els.deviceLabel.textContent = d === "coreml" ? "CoreML · M4" : d.toUpperCase();
+    }
+    if (typeof data.recorded_frames === "number") {
+      setRecordingUi(!!data.recording, data.recorded_frames);
     }
     const summary = data.summary || [];
     const detections = data.detections || [];
@@ -119,6 +153,8 @@
 
   async function startLive() {
     try {
+      hideDownload();
+      setRecordingUi(false, 0);
       els.statusText.textContent = "Requesting camera…";
       state.stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false,
@@ -130,17 +166,41 @@
       state.ws.onopen = () => {
         state.ws.send(JSON.stringify({ type: "config", confidence: Number(els.confSlider.value) / 100 }));
         setRunning(true);
-        els.statusText.textContent = "Live detection (Rust)";
+        els.statusText.textContent = "Live detection · recording annotated video";
         showPlaceholder(false);
+        setRecordingUi(true, 0);
         pumpLiveFrames();
       };
       state.ws.onmessage = (ev) => {
         const data = JSON.parse(ev.data);
-        if (data.type === "result") { state.busyFrame = false; showFrame(data.frame); renderResults(data); }
-        else if (data.type === "error") els.statusText.textContent = data.message || "Error";
+        if (data.type === "result") {
+          state.busyFrame = false;
+          showFrame(data.frame);
+          renderResults(data);
+        } else if (data.type === "recording_started") {
+          setRecordingUi(true, 0);
+          els.statusText.textContent = "Live · REC on";
+        } else if (data.type === "recording_ready") {
+          setRecordingUi(false, data.frames || 0);
+          if (data.output) {
+            showDownload(data.output);
+            els.statusText.textContent = `Saved · ${data.frames || 0} frames — download ready`;
+          } else {
+            els.statusText.textContent = "Stopped (no frames to save)";
+          }
+          finishLiveCleanup();
+        } else if (data.type === "error") {
+          els.statusText.textContent = data.message || "Error";
+        }
       };
       state.ws.onerror = () => { els.statusText.textContent = "WebSocket error"; };
-      state.ws.onclose = () => { if (state.running) stopAll(); };
+      state.ws.onclose = () => {
+        if (state.running && !state.stopping) {
+          // unexpected close
+          finishLiveCleanup();
+          els.statusText.textContent = "Connection closed";
+        }
+      };
     } catch (err) {
       console.error(err);
       els.statusText.textContent = "Camera permission denied";
@@ -151,7 +211,7 @@
 
   function pumpLiveFrames() {
     const tick = () => {
-      if (!state.running || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+      if (!state.running || state.stopping || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
       if (!state.busyFrame) {
         const video = els.webcam;
         if (video.readyState >= 2) {
@@ -174,11 +234,12 @@
     if (!state.selectedFile) { alert("Please choose a video file first."); return; }
     try {
       setRunning(true);
+      hideDownload();
+      setRecordingUi(false, 0);
       els.statusText.textContent = "Uploading video…";
       els.progressBar.hidden = false;
       els.progressFill.style.width = "0%";
       els.progressLabel.textContent = "Uploading…";
-      els.downloadLink.hidden = true;
       const form = new FormData();
       form.append("file", state.selectedFile);
       const res = await fetch("/api/upload", { method: "POST", body: form });
@@ -205,10 +266,10 @@
           els.progressFill.style.width = `${pct}%`;
           els.progressLabel.textContent = `${pct}% · frame ${data.frame_index}`;
         } else if (data.type === "done") {
-          els.statusText.textContent = `Done · ${data.processed} frames`;
+          els.statusText.textContent = `Done · ${data.processed} frames processed`;
           els.progressFill.style.width = "100%";
           els.progressLabel.textContent = "100%";
-          if (data.output) { els.downloadLink.hidden = false; els.downloadLink.href = data.output; }
+          if (data.output) showDownload(data.output);
           setRunning(false);
           state.ws = null;
         } else if (data.type === "error") {
@@ -224,8 +285,49 @@
     }
   }
 
-  function stopAll() {
+  function finishLiveCleanup() {
     state.running = false;
+    state.stopping = false;
+    state.busyFrame = false;
+    if (state.loopId) { cancelAnimationFrame(state.loopId); state.loopId = null; }
+    if (state.stream) {
+      state.stream.getTracks().forEach(t => t.stop());
+      state.stream = null;
+    }
+    els.webcam.srcObject = null;
+    if (state.ws) {
+      try { state.ws.close(); } catch (_) {}
+      state.ws = null;
+    }
+    setRunning(false);
+    setRecordingUi(false, Number(els.recFrames?.textContent || 0));
+  }
+
+  function stopAll() {
+    if (state.mode === "live" && state.ws && state.ws.readyState === WebSocket.OPEN && state.running) {
+      // Ask server to finalize annotated MP4, then wait for recording_ready.
+      state.stopping = true;
+      state.running = false;
+      if (state.loopId) { cancelAnimationFrame(state.loopId); state.loopId = null; }
+      els.statusText.textContent = "Saving annotated video…";
+      els.btnStop.disabled = true;
+      try {
+        state.ws.send(JSON.stringify({ type: "stop" }));
+      } catch (_) {
+        finishLiveCleanup();
+      }
+      // Safety timeout if server never replies
+      setTimeout(() => {
+        if (state.ws) {
+          els.statusText.textContent = "Save timed out — try again";
+          finishLiveCleanup();
+        }
+      }, 60000);
+      return;
+    }
+
+    state.running = false;
+    state.stopping = false;
     state.busyFrame = false;
     if (state.loopId) { cancelAnimationFrame(state.loopId); state.loopId = null; }
     if (state.ws && state.ws.readyState === WebSocket.OPEN) {
@@ -235,6 +337,7 @@
     if (state.stream) { state.stream.getTracks().forEach(t => t.stop()); state.stream = null; }
     els.webcam.srcObject = null;
     setRunning(false);
+    setRecordingUi(false, 0);
     els.statusText.textContent = "Stopped";
   }
 
