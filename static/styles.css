@@ -293,3 +293,15 @@ body {
   box-shadow: 0 0 0 3px rgba(255, 92, 122, 0.25);
   animation: pulse 1.2s ease infinite;
 }
+
+.btn.download-btn {
+  background: linear-gradient(135deg, #3dd6c6, #2bb3a5);
+  color: #06241f;
+  border: none;
+  box-shadow: 0 4px 16px rgba(61, 214, 198, 0.3);
+  font-weight: 700;
+}
+.btn.download-btn:hover:not(:disabled) { filter: brightness(1.06); }
+.btn.download-btn:disabled {
+  opacity: 0.6;
+}

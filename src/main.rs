@@ -258,6 +258,15 @@ async fn download_annotated(
     State(state): State<AppState>,
     AxumPath(job_id): AxumPath<String>,
 ) -> impl IntoResponse {
+    // Sanitize job id (only hex from uuid simple)
+    if !job_id.chars().all(|c| c.is_ascii_hexdigit()) || job_id.is_empty() || job_id.len() > 32 {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Invalid job id" })),
+        )
+            .into_response();
+    }
+
     let path = state
         .root
         .join("outputs")
@@ -265,18 +274,30 @@ async fn download_annotated(
     if !path.exists() {
         return (
             axum::http::StatusCode::NOT_FOUND,
-            Json(json!({ "error": "Not ready" })),
+            Json(json!({ "error": "Annotated video not found. Processing may have failed." })),
         )
             .into_response();
     }
+
     match tokio::fs::read(&path).await {
         Ok(bytes) => {
-            let disp = format!("attachment; filename=\"{job_id}_annotated.mp4\"");
+            let filename = format!("yolo_annotated_{job_id}.mp4");
+            let disp = format!("attachment; filename=\"{filename}\"");
             (
                 axum::http::StatusCode::OK,
                 [
-                    (axum::http::header::CONTENT_TYPE, "video/mp4".to_string()),
-                    (axum::http::header::CONTENT_DISPOSITION, disp),
+                    (
+                        axum::http::header::CONTENT_TYPE,
+                        "video/mp4".to_string(),
+                    ),
+                    (
+                        axum::http::header::CONTENT_DISPOSITION,
+                        disp,
+                    ),
+                    (
+                        axum::http::header::CACHE_CONTROL,
+                        "no-store".to_string(),
+                    ),
                 ],
                 bytes,
             )
@@ -727,29 +748,79 @@ async fn handle_video_ws(socket: WebSocket, state: AppState, job_id: String) {
         .root
         .join("outputs")
         .join(format!("{job_id}_annotated.mp4"));
-    let mut output_url = None;
+    let mut output_url: Option<String> = None;
+    let mut assemble_error: Option<String> = None;
+
     if processed > 0 {
         let pattern = frames_dir.join("frame_%06d.jpg");
-        let status = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-framerate",
-                &format!("{}", target_fps.min(src_fps.max(1.0))),
-                "-i",
-                pattern.to_str().unwrap_or(""),
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
-                out_video.to_str().unwrap_or(""),
-            ])
-            .status();
-        if status.map(|s| s.success()).unwrap_or(false) {
+        let fps = target_fps.min(src_fps.max(1.0));
+        // scale=... forces even dims (yuv420p / libx264 requirement)
+        let vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2".to_string();
+        let pattern_s = pattern.to_string_lossy().to_string();
+        let out_s = out_video.to_string_lossy().to_string();
+        let frames_dir_clone = frames_dir.clone();
+        let out_clone = out_video.clone();
+
+        let (ok, err_msg) = tokio::task::spawn_blocking(move || {
+            let output = Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-framerate",
+                    &format!("{fps:.3}"),
+                    "-i",
+                    &pattern_s,
+                    "-vf",
+                    &vf,
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-movflags",
+                    "+faststart",
+                    &out_s,
+                ])
+                .output();
+            match output {
+                Ok(o) if o.status.success() && out_clone.exists() => {
+                    let _ = std::fs::remove_dir_all(&frames_dir_clone);
+                    (true, None)
+                }
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                    (
+                        false,
+                        Some(if stderr.is_empty() {
+                            format!("ffmpeg exited with status {}", o.status)
+                        } else {
+                            stderr
+                        }),
+                    )
+                }
+                Err(e) => (false, Some(format!("ffmpeg spawn failed: {e}"))),
+            }
+        })
+        .await
+        .unwrap_or((false, Some("assemble task join failed".into())));
+
+        if ok {
+            info!(
+                "Upload annotated video ready: {} ({} frames)",
+                out_video.display(),
+                processed
+            );
             output_url = Some(format!("/api/download/{job_id}"));
+        } else {
+            error!("Annotated video assemble failed for {job_id}: {err_msg:?}");
+            assemble_error = err_msg;
+            // keep frames_dir for debugging if failed
         }
+    } else {
+        assemble_error = Some("No frames were processed".into());
         let _ = std::fs::remove_dir_all(&frames_dir);
     }
 
@@ -758,7 +829,8 @@ async fn handle_video_ws(socket: WebSocket, state: AppState, job_id: String) {
             json!({
                 "type": "done",
                 "processed": processed,
-                "output": output_url
+                "output": output_url,
+                "error": assemble_error,
             })
             .to_string()
             .into(),

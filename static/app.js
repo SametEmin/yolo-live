@@ -6,7 +6,7 @@
     captureCanvas: $("captureCanvas"), outputFrame: $("outputFrame"), placeholder: $("placeholder"),
     placeholderTitle: $("placeholderTitle"), placeholderText: $("placeholderText"),
     uploadZone: $("uploadZone"), fileInput: $("fileInput"), btnPickFile: $("btnPickFile"),
-    fileName: $("fileName"), downloadLink: $("downloadLink"), summaryList: $("summaryList"),
+    fileName: $("fileName"), downloadBtn: $("downloadBtn"), downloadHint: $("downloadHint"), summaryList: $("summaryList"),
     instanceList: $("instanceList"), labelCount: $("labelCount"), fpsValue: $("fpsValue"),
     infValue: $("infValue"), objValue: $("objValue"), deviceLabel: $("deviceLabel"),
     deviceChip: $("deviceChip"), statusText: $("statusText"), progressBar: $("progressBar"),
@@ -91,15 +91,87 @@
     els.outputFrame.hidden = false;
     els.outputFrame.src = dataUrl;
   }
+  let pendingDownloadUrl = null;
+
   function hideDownload() {
-    els.downloadLink.hidden = true;
-    els.downloadLink.removeAttribute("href");
+    pendingDownloadUrl = null;
+    if (els.downloadBtn) {
+      els.downloadBtn.hidden = true;
+      els.downloadBtn.disabled = false;
+      els.downloadBtn.textContent = "Download annotated video";
+    }
+    if (els.downloadHint) {
+      els.downloadHint.hidden = true;
+      els.downloadHint.textContent = "";
+    }
   }
-  function showDownload(url) {
+  function showDownload(url, label) {
     if (!url) return;
-    els.downloadLink.hidden = false;
-    els.downloadLink.href = url;
-    els.downloadLink.setAttribute("download", "");
+    pendingDownloadUrl = url;
+    if (els.downloadBtn) {
+      els.downloadBtn.hidden = false;
+      els.downloadBtn.disabled = false;
+      els.downloadBtn.textContent = "Download annotated video";
+    }
+    if (els.downloadHint) {
+      els.downloadHint.hidden = false;
+      els.downloadHint.textContent = label || "Ready to download";
+    }
+  }
+
+  async function downloadAnnotatedFile() {
+    if (!pendingDownloadUrl) {
+      alert("No annotated video is ready yet.");
+      return;
+    }
+    const btn = els.downloadBtn;
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Preparing download…";
+    }
+    try {
+      const res = await fetch(pendingDownloadUrl);
+      if (!res.ok) {
+        let msg = `Download failed (HTTP ${res.status})`;
+        try {
+          const j = await res.json();
+          if (j.error) msg = j.error;
+        } catch (_) {}
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      if (!blob || blob.size < 100) throw new Error("Downloaded file is empty");
+      const cd = res.headers.get("content-disposition") || "";
+      let filename = "yolo_annotated.mp4";
+      const m = /filename="?([^";]+)"?/i.exec(cd);
+      if (m) filename = m[1];
+      const objectUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = objectUrl;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 2000);
+      els.statusText.textContent = `Downloaded ${filename} (${(blob.size / (1024 * 1024)).toFixed(1)} MB)`;
+      if (els.downloadHint) {
+        els.downloadHint.hidden = false;
+        els.downloadHint.textContent = `Saved ${filename}`;
+      }
+    } catch (err) {
+      console.error(err);
+      alert(err.message || "Download failed");
+      els.statusText.textContent = err.message || "Download failed";
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "Download annotated video";
+      }
+    }
+  }
+
+  if (els.downloadBtn) {
+    els.downloadBtn.addEventListener("click", () => downloadAnnotatedFile());
   }
   function setRecordingUi(on, frames) {
     if (!els.recordPill) return;
@@ -183,8 +255,8 @@
         } else if (data.type === "recording_ready") {
           setRecordingUi(false, data.frames || 0);
           if (data.output) {
-            showDownload(data.output);
-            els.statusText.textContent = `Saved · ${data.frames || 0} frames — download ready`;
+            showDownload(data.output, `${data.frames || 0} live frames ready`);
+            els.statusText.textContent = `Saved · ${data.frames || 0} frames — click Download`;
           } else {
             els.statusText.textContent = "Stopped (no frames to save)";
           }
@@ -266,10 +338,16 @@
           els.progressFill.style.width = `${pct}%`;
           els.progressLabel.textContent = `${pct}% · frame ${data.frame_index}`;
         } else if (data.type === "done") {
-          els.statusText.textContent = `Done · ${data.processed} frames processed`;
           els.progressFill.style.width = "100%";
           els.progressLabel.textContent = "100%";
-          if (data.output) showDownload(data.output);
+          if (data.output) {
+            showDownload(data.output, `${data.processed} frames ready`);
+            els.statusText.textContent = `Done · ${data.processed} frames — click Download`;
+          } else {
+            const err = data.error || "Could not build annotated video";
+            els.statusText.textContent = `Done but no download: ${err}`;
+            alert(`Processing finished but annotated video was not created.\n${err}`);
+          }
           setRunning(false);
           state.ws = null;
         } else if (data.type === "error") {
