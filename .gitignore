@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+.DS_Store
+uploads/*
+!uploads/.gitkeep
+outputs/*
+!outputs/.gitkeep
+.env
+.idea
+.vscode
+*.log
+.venv
+__pycache__

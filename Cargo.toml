@@ -1,0 +1,38 @@
+[package]
+name = "yolo_live"
+version = "0.1.0"
+edition = "2021"
+description = "Real-time YOLO object detection for Apple Silicon (M4) — pure Rust"
+license = "MIT"
+authors = ["SametEmin"]
+repository = "https://github.com/SametEmin/yolo-live"
+readme = "README.md"
+keywords = ["yolo", "object-detection", "onnx", "coreml", "apple-silicon"]
+categories = ["multimedia", "science"]
+
+[dependencies]
+axum = { version = "0.8", features = ["ws", "multipart", "macros"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+image = { version = "0.25", default-features = true, features = ["jpeg", "png"] }
+imageproc = "0.25"
+ab_glyph = "0.2"
+ndarray = "0.16"
+ort = { version = "2.0.0-rc.10", features = ["download-binaries", "coreml"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+thiserror = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+futures-util = "0.3"
+bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

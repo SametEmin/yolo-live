@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>YOLO Live · Rust · M4</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">
+          <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+            <rect x="2" y="2" width="10" height="10" rx="2" stroke="currentColor" stroke-width="2"/>
+            <rect x="16" y="2" width="10" height="10" rx="2" stroke="currentColor" stroke-width="2"/>
+            <rect x="2" y="16" width="10" height="10" rx="2" stroke="currentColor" stroke-width="2"/>
+            <circle cx="21" cy="21" r="4" fill="currentColor"/>
+          </svg>
+        </div>
+        <div>
+          <h1>YOLO Live</h1>
+          <p class="subtitle">Pure Rust · YOLO11n · CoreML on Apple M4</p>
+        </div>
+      </div>
+      <div class="top-stats">
+        <div class="stat-chip" id="deviceChip" title="Compute device">
+          <span class="dot"></span>
+          <span id="deviceLabel">—</span>
+        </div>
+        <div class="stat-chip mono">
+          <span class="stat-k">FPS</span>
+          <span id="fpsValue">0</span>
+        </div>
+        <div class="stat-chip mono">
+          <span class="stat-k">INF</span>
+          <span id="infValue">—</span><span class="unit">ms</span>
+        </div>
+        <div class="stat-chip mono">
+          <span class="stat-k">OBJ</span>
+          <span id="objValue">0</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="stage-panel">
+        <div class="mode-bar">
+          <div class="mode-toggle" role="tablist">
+            <button class="mode-btn active" data-mode="live" id="btnLive" role="tab" aria-selected="true">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/></svg>
+              Live Camera
+            </button>
+            <button class="mode-btn" data-mode="upload" id="btnUpload" role="tab" aria-selected="false">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              Upload Video
+            </button>
+          </div>
+
+          <div class="controls">
+            <label class="conf-control" title="Detection confidence threshold">
+              <span>Confidence</span>
+              <input type="range" id="confSlider" min="5" max="90" value="35" />
+              <span class="mono" id="confValue">0.35</span>
+            </label>
+            <button class="btn primary" id="btnStart">Start</button>
+            <button class="btn ghost" id="btnStop" disabled>Stop</button>
+          </div>
+        </div>
+
+        <div class="stage" id="stage">
+          <video id="webcam" playsinline muted autoplay hidden></video>
+          <canvas id="captureCanvas" hidden></canvas>
+          <img id="outputFrame" alt="Detection output" hidden />
+          <div class="placeholder" id="placeholder">
+            <div class="placeholder-icon">
+              <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <rect x="3" y="5" width="18" height="14" rx="2"/>
+                <circle cx="12" cy="12" r="3"/>
+                <path d="M3 9h2M19 9h2M3 15h2M19 15h2"/>
+              </svg>
+            </div>
+            <h2 id="placeholderTitle">Ready to detect</h2>
+            <p id="placeholderText">Choose <strong>Live Camera</strong> for real-time detection, or <strong>Upload Video</strong> to analyze a file. Backend is 100% Rust.</p>
+          </div>
+          <div class="progress-bar" id="progressBar" hidden>
+            <div class="progress-fill" id="progressFill"></div>
+            <span class="progress-label mono" id="progressLabel">0%</span>
+          </div>
+        </div>
+
+        <div class="upload-zone" id="uploadZone" hidden>
+          <input type="file" id="fileInput" accept="video/mp4,video/quicktime,video/webm,video/x-msvideo,.mp4,.mov,.webm,.avi,.mkv,.m4v" hidden />
+          <button class="btn secondary" id="btnPickFile">Choose video file</button>
+          <span class="file-name" id="fileName">No file selected</span>
+          <a class="download-link" id="downloadLink" hidden href="#">Download annotated video</a>
+        </div>
+      </section>
+
+      <aside class="labels-panel">
+        <div class="panel-header">
+          <h2>Detected Labels</h2>
+          <span class="badge" id="labelCount">0</span>
+        </div>
+        <p class="panel-hint">Objects found in the current frame, grouped by class.</p>
+
+        <div class="summary-list" id="summaryList">
+          <div class="empty-state">
+            <p>No objects yet</p>
+            <span>Start detection to see labels here</span>
+          </div>
+        </div>
+
+        <div class="panel-section">
+          <h3>Instances</h3>
+          <div class="instance-list" id="instanceList"></div>
+        </div>
+      </aside>
+    </main>
+
+    <footer class="footer">
+      <span>Rust · ONNX Runtime · CoreML · YOLO11n</span>
+      <span id="statusText">Idle</span>
+    </footer>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
