@@ -1,21 +1,46 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   const els = {
-    btnLive: $("btnLive"), btnUpload: $("btnUpload"), btnStart: $("btnStart"), btnStop: $("btnStop"),
-    confSlider: $("confSlider"), confValue: $("confValue"), webcam: $("webcam"),
-    captureCanvas: $("captureCanvas"), outputFrame: $("outputFrame"), placeholder: $("placeholder"),
-    placeholderTitle: $("placeholderTitle"), placeholderText: $("placeholderText"),
-    uploadZone: $("uploadZone"), fileInput: $("fileInput"), btnPickFile: $("btnPickFile"),
-    fileName: $("fileName"), downloadBtn: $("downloadBtn"), downloadHint: $("downloadHint"), summaryList: $("summaryList"),
-    instanceList: $("instanceList"), labelCount: $("labelCount"), fpsValue: $("fpsValue"),
-    infValue: $("infValue"), objValue: $("objValue"), deviceLabel: $("deviceLabel"),
-    deviceChip: $("deviceChip"), statusText: $("statusText"), progressBar: $("progressBar"),
-    progressFill: $("progressFill"), progressLabel: $("progressLabel"),
-    recordPill: $("recordPill"), recFrames: $("recFrames"),
+    btnLive: $("btnLive"),
+    btnUpload: $("btnUpload"),
+    btnStart: $("btnStart"),
+    btnPause: $("btnPause"),
+    btnResume: $("btnResume"),
+    btnStop: $("btnStop"),
+    confSlider: $("confSlider"),
+    confValue: $("confValue"),
+    webcam: $("webcam"),
+    captureCanvas: $("captureCanvas"),
+    outputFrame: $("outputFrame"),
+    placeholder: $("placeholder"),
+    placeholderTitle: $("placeholderTitle"),
+    placeholderText: $("placeholderText"),
+    uploadZone: $("uploadZone"),
+    fileInput: $("fileInput"),
+    btnPickFile: $("btnPickFile"),
+    fileName: $("fileName"),
+    downloadBtn: $("downloadBtn"),
+    downloadHint: $("downloadHint"),
+    summaryList: $("summaryList"),
+    instanceList: $("instanceList"),
+    labelCount: $("labelCount"),
+    fpsValue: $("fpsValue"),
+    infValue: $("infValue"),
+    objValue: $("objValue"),
+    deviceLabel: $("deviceLabel"),
+    deviceChip: $("deviceChip"),
+    statusText: $("statusText"),
+    progressBar: $("progressBar"),
+    progressFill: $("progressFill"),
+    progressLabel: $("progressLabel"),
+    recordPill: $("recordPill"),
+    recFrames: $("recFrames"),
   };
+
   const state = {
     mode: "live",
     running: false,
+    paused: false,
     ws: null,
     stream: null,
     loopId: null,
@@ -23,24 +48,36 @@
     selectedFile: null,
     busyFrame: false,
     stopping: false,
+    expectedFrames: 0,
+    processed: 0,
   };
 
-  fetch("/api/health").then(r => r.json()).then(d => {
-    const dev = (d.device || "cpu").toLowerCase();
-    els.deviceLabel.textContent = dev === "coreml" ? "CoreML · M4" : dev.toUpperCase();
-    if (dev === "coreml" || dev === "mps") els.deviceChip.classList.add("live");
-    els.statusText.textContent = `Rust · ${d.model} ready`;
-  }).catch(() => { els.deviceLabel.textContent = "offline"; els.statusText.textContent = "Server unreachable"; });
+  let pendingDownloadUrl = null;
+
+  fetch("/api/health")
+    .then((r) => r.json())
+    .then((d) => {
+      const dev = (d.device || "cpu").toLowerCase();
+      els.deviceLabel.textContent = dev === "coreml" ? "CoreML · M4" : dev.toUpperCase();
+      if (dev === "coreml" || dev === "mps") els.deviceChip.classList.add("live");
+      els.statusText.textContent = `Rust · ${d.model} ready`;
+    })
+    .catch(() => {
+      els.deviceLabel.textContent = "offline";
+      els.statusText.textContent = "Server unreachable";
+    });
 
   function setMode(mode) {
-    if (state.running) stopAll();
+    if (state.running || state.paused) stopAll(true);
     state.mode = mode;
+    state.paused = false;
     els.btnLive.classList.toggle("active", mode === "live");
     els.btnUpload.classList.toggle("active", mode === "upload");
     els.uploadZone.hidden = mode !== "upload";
     els.progressBar.hidden = true;
     hideDownload();
     setRecordingUi(false, 0);
+    updateControlVisibility();
     if (mode === "live") {
       els.placeholderTitle.textContent = "Live camera mode";
       els.placeholderText.innerHTML =
@@ -50,12 +87,33 @@
     } else {
       els.placeholderTitle.textContent = "Upload a video";
       els.placeholderText.innerHTML =
-        "Choose a video file, then click <strong>Start</strong> to run YOLO frame by frame.";
+        "Choose a video, then <strong>Start detection</strong>. Use <strong>Pause</strong> / <strong>Resume</strong>, and download a partial annotated video anytime.";
       els.btnStart.textContent = "Start detection";
-      els.btnStop.textContent = "Stop";
+      els.btnStop.textContent = "Stop & save";
     }
     showPlaceholder(true);
   }
+
+  function updateControlVisibility() {
+    const upload = state.mode === "upload";
+    const active = state.running || state.paused;
+    if (els.btnPause) {
+      els.btnPause.hidden = !upload;
+      els.btnPause.disabled = !state.running || state.paused;
+    }
+    if (els.btnResume) {
+      els.btnResume.hidden = !upload;
+      els.btnResume.disabled = !state.paused;
+    }
+    els.btnStart.disabled = active;
+    els.btnStop.disabled = !active && !(state.mode === "live" && state.running);
+    if (state.mode === "live") {
+      els.btnStop.disabled = !state.running && !state.stopping;
+    }
+    els.btnLive.disabled = active;
+    els.btnUpload.disabled = active;
+  }
+
   els.btnLive.addEventListener("click", () => setMode("live"));
   els.btnUpload.addEventListener("click", () => setMode("upload"));
   els.confSlider.addEventListener("input", () => {
@@ -71,27 +129,46 @@
     els.fileName.textContent = f ? f.name : "No file selected";
     hideDownload();
   });
-  els.btnStart.addEventListener("click", () => state.mode === "live" ? startLive() : startUpload());
-  els.btnStop.addEventListener("click", () => stopAll());
-
-  function setRunning(on) {
-    state.running = on;
-    els.btnStart.disabled = on;
-    els.btnStop.disabled = !on;
-    els.btnLive.disabled = on;
-    els.btnUpload.disabled = on;
-    if (on) els.deviceChip.classList.add("live");
+  els.btnStart.addEventListener("click", () =>
+    state.mode === "live" ? startLive() : startUpload()
+  );
+  els.btnStop.addEventListener("click", () => stopAll(false));
+  if (els.btnPause) {
+    els.btnPause.addEventListener("click", () => {
+      if (!state.ws || state.ws.readyState !== WebSocket.OPEN || !state.running) return;
+      state.ws.send(JSON.stringify({ type: "pause" }));
+      els.statusText.textContent = "Pausing…";
+      els.btnPause.disabled = true;
+    });
   }
+  if (els.btnResume) {
+    els.btnResume.addEventListener("click", () => {
+      if (!state.ws || state.ws.readyState !== WebSocket.OPEN || !state.paused) return;
+      state.ws.send(JSON.stringify({ type: "resume" }));
+      els.statusText.textContent = "Resuming detection…";
+      els.btnResume.disabled = true;
+    });
+  }
+
+  function setRunningFlags({ running = false, paused = false } = {}) {
+    state.running = running;
+    state.paused = paused;
+    if (running) els.deviceChip.classList.add("live");
+    updateControlVisibility();
+  }
+
   function showPlaceholder(show) {
     els.placeholder.hidden = !show;
-    if (show) { els.outputFrame.hidden = true; els.outputFrame.removeAttribute("src"); }
+    if (show) {
+      els.outputFrame.hidden = true;
+      els.outputFrame.removeAttribute("src");
+    }
   }
   function showFrame(dataUrl) {
     els.placeholder.hidden = true;
     els.outputFrame.hidden = false;
     els.outputFrame.src = dataUrl;
   }
-  let pendingDownloadUrl = null;
 
   function hideDownload() {
     pendingDownloadUrl = null;
@@ -119,9 +196,48 @@
     }
   }
 
+  function updateProgress(progress, processed, expected) {
+    const p = Math.max(0, Math.min(Number(progress) || 0, 1));
+    // Never paint a full bar unless truly complete (progress === 1)
+    const pct = p >= 0.999 && p < 1 ? 99 : Math.round(p * 100);
+    els.progressBar.hidden = false;
+    els.progressFill.style.width = `${pct}%`;
+    const exp = expected || state.expectedFrames || 0;
+    const proc = processed || state.processed || 0;
+    if (exp > 0) {
+      els.progressLabel.textContent = `${pct}% · ${proc} / ${exp} frames`;
+    } else {
+      els.progressLabel.textContent = `${pct}% · frame ${proc}`;
+    }
+  }
+
   async function downloadAnnotatedFile() {
+    // If still processing, ask server to export current frames first.
+    if (
+      state.mode === "upload" &&
+      state.ws &&
+      state.ws.readyState === WebSocket.OPEN &&
+      (state.running || state.paused) &&
+      state.processed > 0
+    ) {
+      els.statusText.textContent = "Exporting annotated video so far…";
+      if (els.downloadBtn) {
+        els.downloadBtn.disabled = true;
+        els.downloadBtn.textContent = "Exporting…";
+      }
+      try {
+        state.ws.send(JSON.stringify({ type: "export" }));
+      } catch (_) {}
+      // export_ready handler will call performDownload
+      state._downloadAfterExport = true;
+      return;
+    }
+    await performDownload();
+  }
+
+  async function performDownload() {
     if (!pendingDownloadUrl) {
-      alert("No annotated video is ready yet.");
+      alert("No annotated video is ready yet. Process at least one frame first.");
       return;
     }
     const btn = els.downloadBtn;
@@ -167,23 +283,30 @@
         btn.disabled = false;
         btn.textContent = "Download annotated video";
       }
+      state._downloadAfterExport = false;
     }
   }
 
   if (els.downloadBtn) {
     els.downloadBtn.addEventListener("click", () => downloadAnnotatedFile());
   }
+
   function setRecordingUi(on, frames) {
     if (!els.recordPill) return;
     els.recordPill.hidden = !on;
     if (els.recFrames) els.recFrames.textContent = String(frames || 0);
   }
   function escapeHtml(s) {
-    return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
   }
   function renderResults(data) {
     if (typeof data.fps === "number") els.fpsValue.textContent = data.fps.toFixed(1);
-    if (typeof data.inference_ms === "number") els.infValue.textContent = data.inference_ms.toFixed(0);
+    if (typeof data.inference_ms === "number")
+      els.infValue.textContent = data.inference_ms.toFixed(0);
     if (typeof data.count === "number") els.objValue.textContent = String(data.count);
     if (data.device) {
       const d = String(data.device).toLowerCase();
@@ -198,7 +321,9 @@
     if (!summary.length) {
       els.summaryList.innerHTML = `<div class="empty-state"><p>No objects in frame</p><span>Try lowering confidence</span></div>`;
     } else {
-      els.summaryList.innerHTML = summary.map(s => `
+      els.summaryList.innerHTML = summary
+        .map(
+          (s) => `
         <div class="label-card">
           <span class="swatch" style="background:${s.color}"></span>
           <div class="label-meta">
@@ -206,13 +331,20 @@
             <div class="label-sub">avg ${(s.avg_confidence * 100).toFixed(0)}% conf</div>
           </div>
           <span class="count-pill">×${s.count}</span>
-        </div>`).join("");
+        </div>`
+        )
+        .join("");
     }
-    els.instanceList.innerHTML = detections.slice(0, 40).map(d => `
+    els.instanceList.innerHTML = detections
+      .slice(0, 40)
+      .map(
+        (d) => `
       <div class="instance-row">
         <span class="name"><span class="swatch" style="background:${d.color}"></span>${escapeHtml(d.label)}</span>
         <span class="conf">${(d.confidence * 100).toFixed(0)}%</span>
-      </div>`).join("");
+      </div>`
+      )
+      .join("");
   }
   function clearLabels() {
     els.summaryList.innerHTML = `<div class="empty-state"><p>No objects yet</p><span>Start detection to see labels here</span></div>`;
@@ -229,15 +361,18 @@
       setRecordingUi(false, 0);
       els.statusText.textContent = "Requesting camera…";
       state.stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false,
+        video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false,
       });
       els.webcam.srcObject = state.stream;
       await els.webcam.play();
       const proto = location.protocol === "https:" ? "wss" : "ws";
       state.ws = new WebSocket(`${proto}://${location.host}/ws/detect`);
       state.ws.onopen = () => {
-        state.ws.send(JSON.stringify({ type: "config", confidence: Number(els.confSlider.value) / 100 }));
-        setRunning(true);
+        state.ws.send(
+          JSON.stringify({ type: "config", confidence: Number(els.confSlider.value) / 100 })
+        );
+        setRunningFlags({ running: true });
         els.statusText.textContent = "Live detection · recording annotated video";
         showPlaceholder(false);
         setRecordingUi(true, 0);
@@ -265,10 +400,11 @@
           els.statusText.textContent = data.message || "Error";
         }
       };
-      state.ws.onerror = () => { els.statusText.textContent = "WebSocket error"; };
+      state.ws.onerror = () => {
+        els.statusText.textContent = "WebSocket error";
+      };
       state.ws.onclose = () => {
         if (state.running && !state.stopping) {
-          // unexpected close
           finishLiveCleanup();
           els.statusText.textContent = "Connection closed";
         }
@@ -277,13 +413,14 @@
       console.error(err);
       els.statusText.textContent = "Camera permission denied";
       alert("Could not access the camera.");
-      stopAll();
+      stopAll(true);
     }
   }
 
   function pumpLiveFrames() {
     const tick = () => {
-      if (!state.running || state.stopping || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+      if (!state.running || state.stopping || !state.ws || state.ws.readyState !== WebSocket.OPEN)
+        return;
       if (!state.busyFrame) {
         const video = els.webcam;
         if (video.readyState >= 2) {
@@ -294,7 +431,9 @@
           canvas.height = Math.round((video.videoHeight || 480) * scale);
           canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
           state.busyFrame = true;
-          state.ws.send(JSON.stringify({ type: "frame", frame: canvas.toDataURL("image/jpeg", 0.72) }));
+          state.ws.send(
+            JSON.stringify({ type: "frame", frame: canvas.toDataURL("image/jpeg", 0.72) })
+          );
         }
       }
       state.loopId = requestAnimationFrame(tick);
@@ -303,11 +442,17 @@
   }
 
   async function startUpload() {
-    if (!state.selectedFile) { alert("Please choose a video file first."); return; }
+    if (!state.selectedFile) {
+      alert("Please choose a video file first.");
+      return;
+    }
     try {
-      setRunning(true);
+      setRunningFlags({ running: true });
       hideDownload();
       setRecordingUi(false, 0);
+      state.expectedFrames = 0;
+      state.processed = 0;
+      state._downloadAfterExport = false;
       els.statusText.textContent = "Uploading video…";
       els.progressBar.hidden = false;
       els.progressFill.style.width = "0%";
@@ -319,7 +464,9 @@
       try {
         meta = await res.json();
       } catch (_) {
-        throw new Error(`Upload failed (HTTP ${res.status}). Is the server running the latest build?`);
+        throw new Error(
+          `Upload failed (HTTP ${res.status}). Is the server running the latest build?`
+        );
       }
       if (!res.ok) throw new Error(meta.error || `Upload failed (HTTP ${res.status})`);
       state.jobId = meta.job_id;
@@ -327,39 +474,106 @@
       const proto = location.protocol === "https:" ? "wss" : "ws";
       state.ws = new WebSocket(`${proto}://${location.host}/ws/video/${state.jobId}`);
       state.ws.onopen = () => {
-        state.ws.send(JSON.stringify({ type: "config", confidence: Number(els.confSlider.value) / 100 }));
+        state.ws.send(
+          JSON.stringify({ type: "config", confidence: Number(els.confSlider.value) / 100 })
+        );
       };
       state.ws.onmessage = (ev) => {
         const data = JSON.parse(ev.data);
-        if (data.type === "result") {
+        if (data.type === "start") {
+          state.expectedFrames = data.expected_frames || 0;
+          state.processed = data.processed || 0;
+          updateProgress(data.progress || 0, state.processed, state.expectedFrames);
+          els.statusText.textContent = `Detecting · 0 / ${state.expectedFrames} frames`;
+        } else if (data.type === "result") {
+          state.processed = data.processed || state.processed;
+          if (data.expected_frames) state.expectedFrames = data.expected_frames;
           showFrame(data.frame);
           renderResults(data);
-          const pct = Math.round((data.progress || 0) * 100);
-          els.progressFill.style.width = `${pct}%`;
-          els.progressLabel.textContent = `${pct}% · frame ${data.frame_index}`;
-        } else if (data.type === "done") {
-          els.progressFill.style.width = "100%";
-          els.progressLabel.textContent = "100%";
+          updateProgress(data.progress, state.processed, state.expectedFrames);
+          // Offer download of whatever we have so far
+          if (state.processed > 0 && els.downloadBtn) {
+            els.downloadBtn.hidden = false;
+            els.downloadBtn.textContent = "Download so far";
+            if (els.downloadHint) {
+              els.downloadHint.hidden = false;
+              els.downloadHint.textContent = `${state.processed} frames processed (partial OK)`;
+            }
+          }
+          els.statusText.textContent = `Detecting · ${state.processed} / ${state.expectedFrames || "?"} frames`;
+        } else if (data.type === "paused") {
+          setRunningFlags({ running: false, paused: true });
+          state.processed = data.processed || state.processed;
+          updateProgress(data.progress, state.processed, data.expected_frames || state.expectedFrames);
           if (data.output) {
-            showDownload(data.output, `${data.processed} frames ready`);
-            els.statusText.textContent = `Done · ${data.processed} frames — click Download`;
+            showDownload(
+              data.output,
+              `Paused at ${data.processed} frames — partial download ready`
+            );
+            els.statusText.textContent = `Paused · ${data.processed} / ${data.expected_frames || state.expectedFrames} — download or resume`;
+          } else {
+            els.statusText.textContent = `Paused · ${data.processed} frames${data.error ? " (" + data.error + ")" : ""}`;
+          }
+        } else if (data.type === "resumed") {
+          setRunningFlags({ running: true, paused: false });
+          els.statusText.textContent = `Resumed · ${data.processed} / ${data.expected_frames || state.expectedFrames}`;
+          updateProgress(data.progress, data.processed, data.expected_frames);
+        } else if (data.type === "export_ready") {
+          if (data.output) {
+            showDownload(
+              data.output,
+              data.partial
+                ? `Partial · ${data.processed} frames`
+                : `${data.processed} frames ready`
+            );
+            els.statusText.textContent = data.partial
+              ? `Partial export ready (${data.processed} frames)`
+              : `Export ready (${data.processed} frames)`;
+            if (state._downloadAfterExport) {
+              performDownload();
+            }
+          }
+        } else if (data.type === "done") {
+          state.processed = data.processed || state.processed;
+          updateProgress(1, state.processed, data.expected_frames || state.expectedFrames);
+          els.progressFill.style.width = "100%";
+          els.progressLabel.textContent = `100% · ${state.processed} / ${data.expected_frames || state.expectedFrames || state.processed} frames`;
+          if (data.output) {
+            showDownload(
+              data.output,
+              data.complete
+                ? `${data.processed} frames (complete)`
+                : `${data.processed} frames (stopped early)`
+            );
+            els.statusText.textContent = data.complete
+              ? `Done · ${data.processed} frames — click Download`
+              : `Stopped · ${data.processed} frames saved — click Download`;
           } else {
             const err = data.error || "Could not build annotated video";
-            els.statusText.textContent = `Done but no download: ${err}`;
+            els.statusText.textContent = `Finished but no download: ${err}`;
             alert(`Processing finished but annotated video was not created.\n${err}`);
           }
-          setRunning(false);
+          setRunningFlags({ running: false, paused: false });
           state.ws = null;
         } else if (data.type === "error") {
           els.statusText.textContent = data.message || "Error";
-          stopAll();
+          if (!state.paused) stopAll(true);
+        }
+      };
+      state.ws.onerror = () => {
+        els.statusText.textContent = "WebSocket error";
+      };
+      state.ws.onclose = () => {
+        if (state.running && !state.stopping && !state.paused) {
+          setRunningFlags({ running: false, paused: false });
+          els.statusText.textContent = "Connection closed";
         }
       };
     } catch (err) {
       console.error(err);
       els.statusText.textContent = err.message || "Upload failed";
       alert(err.message || "Upload failed");
-      stopAll();
+      stopAll(true);
     }
   }
 
@@ -367,26 +581,33 @@
     state.running = false;
     state.stopping = false;
     state.busyFrame = false;
-    if (state.loopId) { cancelAnimationFrame(state.loopId); state.loopId = null; }
+    if (state.loopId) {
+      cancelAnimationFrame(state.loopId);
+      state.loopId = null;
+    }
     if (state.stream) {
-      state.stream.getTracks().forEach(t => t.stop());
+      state.stream.getTracks().forEach((t) => t.stop());
       state.stream = null;
     }
     els.webcam.srcObject = null;
     if (state.ws) {
-      try { state.ws.close(); } catch (_) {}
+      try {
+        state.ws.close();
+      } catch (_) {}
       state.ws = null;
     }
-    setRunning(false);
+    setRunningFlags({ running: false, paused: false });
     setRecordingUi(false, Number(els.recFrames?.textContent || 0));
   }
 
-  function stopAll() {
+  function stopAll(force) {
     if (state.mode === "live" && state.ws && state.ws.readyState === WebSocket.OPEN && state.running) {
-      // Ask server to finalize annotated MP4, then wait for recording_ready.
       state.stopping = true;
       state.running = false;
-      if (state.loopId) { cancelAnimationFrame(state.loopId); state.loopId = null; }
+      if (state.loopId) {
+        cancelAnimationFrame(state.loopId);
+        state.loopId = null;
+      }
       els.statusText.textContent = "Saving annotated video…";
       els.btnStop.disabled = true;
       try {
@@ -394,7 +615,6 @@
       } catch (_) {
         finishLiveCleanup();
       }
-      // Safety timeout if server never replies
       setTimeout(() => {
         if (state.ws) {
           els.statusText.textContent = "Save timed out — try again";
@@ -404,19 +624,51 @@
       return;
     }
 
+    if (
+      state.mode === "upload" &&
+      state.ws &&
+      state.ws.readyState === WebSocket.OPEN &&
+      (state.running || state.paused) &&
+      !force
+    ) {
+      // Stop & save: finalize partial/full and enable download
+      state.stopping = true;
+      els.statusText.textContent = "Saving annotated video…";
+      els.btnStop.disabled = true;
+      els.btnPause && (els.btnPause.disabled = true);
+      els.btnResume && (els.btnResume.disabled = true);
+      try {
+        state.ws.send(JSON.stringify({ type: "stop" }));
+      } catch (_) {
+        setRunningFlags({ running: false, paused: false });
+        state.ws = null;
+      }
+      return;
+    }
+
     state.running = false;
+    state.paused = false;
     state.stopping = false;
     state.busyFrame = false;
-    if (state.loopId) { cancelAnimationFrame(state.loopId); state.loopId = null; }
+    if (state.loopId) {
+      cancelAnimationFrame(state.loopId);
+      state.loopId = null;
+    }
     if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-      try { state.ws.send(JSON.stringify({ type: "stop" })); state.ws.close(); } catch (_) {}
+      try {
+        state.ws.send(JSON.stringify({ type: "stop" }));
+        state.ws.close();
+      } catch (_) {}
     }
     state.ws = null;
-    if (state.stream) { state.stream.getTracks().forEach(t => t.stop()); state.stream = null; }
+    if (state.stream) {
+      state.stream.getTracks().forEach((t) => t.stop());
+      state.stream = null;
+    }
     els.webcam.srcObject = null;
-    setRunning(false);
+    setRunningFlags({ running: false, paused: false });
     setRecordingUi(false, 0);
-    els.statusText.textContent = "Stopped";
+    if (!pendingDownloadUrl) els.statusText.textContent = "Stopped";
   }
 
   setMode("live");

@@ -305,3 +305,14 @@ body {
 .btn.download-btn:disabled {
   opacity: 0.6;
 }
+
+#btnPause:not([hidden]),
+#btnResume:not([hidden]) {
+  display: inline-flex;
+}
+#btnResume {
+  background: linear-gradient(135deg, #f5a524, #e09210);
+  color: #1a1200;
+  border: none;
+  box-shadow: 0 4px 14px rgba(245, 165, 36, 0.3);
+}

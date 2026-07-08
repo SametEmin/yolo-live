@@ -577,247 +577,407 @@ async fn handle_video_ws(socket: WebSocket, state: AppState, job_id: String) {
         }
     };
 
-    let (src_fps, total_frames, _, _) = probe_video(&video_path);
-    let target_fps = 15.0_f64;
-    let skip = if src_fps > 0.0 {
-        ((src_fps / target_fps).round() as i64).max(1)
+    let meta = probe_video_meta(&video_path);
+    let process_fps = 15.0_f64.min(if meta.fps > 1.0 { meta.fps } else { 15.0 });
+    let duration_s = if meta.duration_s > 0.0 {
+        meta.duration_s
+    } else if meta.frames > 0 && meta.fps > 0.0 {
+        meta.frames as f64 / meta.fps
+    } else {
+        0.0
+    };
+    // Expected *processed* frames at process_fps (what the progress bar should track).
+    let expected_frames = if duration_s > 0.0 {
+        (duration_s * process_fps).ceil().max(1.0) as u64
+    } else if meta.frames > 0 {
+        // Fallback: scale source frame count to process rate
+        let ratio = if meta.fps > 0.0 {
+            (process_fps / meta.fps).clamp(0.05, 1.0)
+        } else {
+            1.0
+        };
+        ((meta.frames as f64) * ratio).ceil().max(1.0) as u64
     } else {
         1
     };
+
+    let frames_dir = state.root.join("outputs").join(format!("{job_id}_frames"));
+    // Fresh session: clear any leftover frames for this job id.
+    let _ = std::fs::remove_dir_all(&frames_dir);
+    let _ = std::fs::create_dir_all(&frames_dir);
+    let mut processed: u64 = 0;
 
     let _ = sender
         .send(Message::Text(
             json!({
                 "type": "start",
-                "total_frames": total_frames,
-                "src_fps": src_fps,
-                "skip": skip
+                "total_source_frames": meta.frames,
+                "src_fps": meta.fps,
+                "process_fps": process_fps,
+                "duration_s": duration_s,
+                "expected_frames": expected_frames,
+                "processed": processed,
+                "progress": progress_value(processed, expected_frames, false),
             })
             .to_string()
             .into(),
         ))
         .await;
 
-    // Extract JPEG frames via ffmpeg pipe
-    let vf = if skip > 1 {
-        format!("fps={target_fps}")
-    } else {
-        "null".to_string()
-    };
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Ctrl {
+        Run,
+        Pause,
+        Stop,
+    }
 
-    let mut child = match Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            video_path.to_str().unwrap_or(""),
-            "-vf",
-            &vf,
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "mjpeg",
-            "-q:v",
-            "5",
-            "-",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = sender
-                .send(Message::Text(
-                    json!({"type":"error","message": format!("ffmpeg failed: {e} (is ffmpeg installed?)")})
-                        .to_string()
-                        .into(),
-                ))
-                .await;
-            return;
+    let mut finished_naturally = false;
+    let mut last_export_url: Option<String> = None;
+
+    'session: loop {
+        // Seek to resume point (seconds into source video).
+        let start_sec = if process_fps > 0.0 {
+            processed as f64 / process_fps
+        } else {
+            0.0
+        };
+
+        // If already past expected end, finish.
+        if expected_frames > 0 && processed >= expected_frames {
+            finished_naturally = true;
+            break 'session;
         }
-    };
 
-    let mut stdout = child.stdout.take().expect("stdout");
-    let mut jpeg_buf: Vec<u8> = Vec::new();
-    let mut read_buf = [0u8; 65536];
-    let mut frame_index: u64 = 0;
-    let mut processed: u64 = 0;
-    let mut stop = false;
+        let mut child = match spawn_frame_extractor(&video_path, process_fps, start_sec) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = sender
+                    .send(Message::Text(
+                        json!({"type":"error","message": e}).to_string().into(),
+                    ))
+                    .await;
+                return;
+            }
+        };
 
-    // Annotated frames dir for optional re-encode
-    let frames_dir = state.root.join("outputs").join(format!("{job_id}_frames"));
-    let _ = std::fs::create_dir_all(&frames_dir);
+        let mut stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => {
+                let _ = sender
+                    .send(Message::Text(
+                        json!({"type":"error","message":"ffmpeg stdout missing"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await;
+                return;
+            }
+        };
 
-    use std::io::Read;
-    loop {
-        // Non-blocking-ish client control: try drain stop messages
-        while let Ok(Some(Ok(msg))) =
-            tokio::time::timeout(std::time::Duration::from_millis(0), receiver.next()).await
-        {
-            if let Message::Text(t) = msg {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
-                    match v.get("type").and_then(|x| x.as_str()) {
-                        Some("stop") => stop = true,
-                        Some("config") => {
-                            if let Some(c) = v.get("confidence").and_then(|c| c.as_f64()) {
-                                state.detector.lock().await.set_confidence(c as f32);
+        let mut jpeg_buf: Vec<u8> = Vec::new();
+        let mut read_buf = [0u8; 65536];
+        let mut ctrl = Ctrl::Run;
+        let mut export_requested = false;
+        let mut reached_eof = false;
+
+        use std::io::Read;
+        'extract: loop {
+            // Drain client control messages (non-blocking)
+            while let Ok(Some(Ok(msg))) =
+                tokio::time::timeout(std::time::Duration::from_millis(0), receiver.next()).await
+            {
+                if let Message::Text(t) = msg {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
+                        match v.get("type").and_then(|x| x.as_str()) {
+                            Some("pause") => ctrl = Ctrl::Pause,
+                            Some("stop") => ctrl = Ctrl::Stop,
+                            Some("export") => export_requested = true,
+                            Some("config") => {
+                                if let Some(c) = v.get("confidence").and_then(|c| c.as_f64()) {
+                                    state.detector.lock().await.set_confidence(c as f32);
+                                }
                             }
+                            // ignore resume while running
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
-        }
-        if stop {
-            break;
-        }
 
-        let n = match stdout.read(&mut read_buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(_) => break,
-        };
-        jpeg_buf.extend_from_slice(&read_buf[..n]);
+            if ctrl != Ctrl::Run {
+                break 'extract;
+            }
 
-        // Split MJPEG stream on SOI/EOI markers
-        while let Some((start, end)) = find_jpeg(&jpeg_buf) {
-            let jpeg = jpeg_buf[start..=end].to_vec();
-            jpeg_buf.drain(..=end);
-            frame_index += 1;
-
-            let det = state.detector.clone();
-            let jpeg_clone = jpeg.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                let mut d = det.blocking_lock();
-                d.predict_jpeg(&jpeg_clone)
-            })
-            .await;
-
-            match result {
-                Ok(Ok((out_jpeg, meta))) => {
-                    processed += 1;
-                    // Save annotated frame for video assembly
-                    let fp = frames_dir.join(format!("frame_{:06}.jpg", processed));
-                    let _ = std::fs::write(&fp, &out_jpeg);
-
-                    let progress = if total_frames > 0 {
-                        // approximate progress by processed * skip / total
-                        ((processed as f64 * skip as f64) / total_frames as f64).min(1.0)
-                    } else {
-                        0.0
-                    };
-
-                    let frame = format!("data:image/jpeg;base64,{}", B64.encode(&out_jpeg));
-                    let payload = json!({
-                        "type": "result",
-                        "frame": frame,
-                        "detections": meta.detections,
-                        "summary": meta.summary,
-                        "fps": meta.fps,
-                        "inference_ms": meta.inference_ms,
-                        "device": meta.device,
-                        "count": meta.count,
-                        "frame_index": frame_index,
-                        "progress": (progress * 10000.0).round() / 10000.0,
-                        "processed": processed
-                    });
-                    if sender
-                        .send(Message::Text(payload.to_string().into()))
-                        .await
-                        .is_err()
+            if export_requested {
+                export_requested = false;
+                if processed > 0 {
+                    match assemble_annotated_video(
+                        &state.root,
+                        &job_id,
+                        &frames_dir,
+                        process_fps,
+                        false, // keep frames
+                    )
+                    .await
                     {
-                        stop = true;
-                        break;
+                        Ok(url) => {
+                            last_export_url = Some(url.clone());
+                            let _ = sender
+                                .send(Message::Text(
+                                    json!({
+                                        "type": "export_ready",
+                                        "output": url,
+                                        "processed": processed,
+                                        "expected_frames": expected_frames,
+                                        "progress": progress_value(processed, expected_frames, false),
+                                        "partial": processed < expected_frames,
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = sender
+                                .send(Message::Text(
+                                    json!({"type":"error","message": format!("Export failed: {e}")})
+                                        .to_string()
+                                        .into(),
+                                ))
+                                .await;
+                        }
                     }
                 }
-                Ok(Err(e)) => {
-                    error!("frame inference: {e:#}");
+            }
+
+            let n = match stdout.read(&mut read_buf) {
+                Ok(0) => {
+                    reached_eof = true;
+                    break 'extract;
                 }
-                Err(e) => error!("join: {e}"),
+                Ok(n) => n,
+                Err(_) => {
+                    reached_eof = true;
+                    break 'extract;
+                }
+            };
+            jpeg_buf.extend_from_slice(&read_buf[..n]);
+
+            while let Some((start, end)) = find_jpeg(&jpeg_buf) {
+                // Re-check control between frames
+                while let Ok(Some(Ok(msg))) =
+                    tokio::time::timeout(std::time::Duration::from_millis(0), receiver.next()).await
+                {
+                    if let Message::Text(t) = msg {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
+                            match v.get("type").and_then(|x| x.as_str()) {
+                                Some("pause") => ctrl = Ctrl::Pause,
+                                Some("stop") => ctrl = Ctrl::Stop,
+                                Some("export") => export_requested = true,
+                                Some("config") => {
+                                    if let Some(c) = v.get("confidence").and_then(|c| c.as_f64()) {
+                                        state.detector.lock().await.set_confidence(c as f32);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                if ctrl != Ctrl::Run {
+                    break 'extract;
+                }
+
+                let jpeg = jpeg_buf[start..=end].to_vec();
+                jpeg_buf.drain(..=end);
+
+                let det = state.detector.clone();
+                let jpeg_clone = jpeg.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let mut d = det.blocking_lock();
+                    d.predict_jpeg(&jpeg_clone)
+                })
+                .await;
+
+                match result {
+                    Ok(Ok((out_jpeg, meta_out))) => {
+                        processed += 1;
+                        let fp = frames_dir.join(format!("frame_{:06}.jpg", processed));
+                        let _ = std::fs::write(&fp, &out_jpeg);
+
+                        let progress = progress_value(processed, expected_frames, false);
+                        let frame = format!("data:image/jpeg;base64,{}", B64.encode(&out_jpeg));
+                        let payload = json!({
+                            "type": "result",
+                            "frame": frame,
+                            "detections": meta_out.detections,
+                            "summary": meta_out.summary,
+                            "fps": meta_out.fps,
+                            "inference_ms": meta_out.inference_ms,
+                            "device": meta_out.device,
+                            "count": meta_out.count,
+                            "frame_index": processed,
+                            "processed": processed,
+                            "expected_frames": expected_frames,
+                            "progress": progress,
+                            "partial": true,
+                        });
+                        if sender
+                            .send(Message::Text(payload.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            ctrl = Ctrl::Stop;
+                            break 'extract;
+                        }
+
+                        // Soft stop if we met/exceeded expected (ffmpeg may overshoot slightly)
+                        if processed >= expected_frames {
+                            reached_eof = true;
+                            break 'extract;
+                        }
+                    }
+                    Ok(Err(e)) => error!("frame inference: {e:#}"),
+                    Err(e) => error!("join: {e}"),
+                }
+
+                if export_requested {
+                    // handle after this frame via top of loop
+                    break;
+                }
+            }
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        if ctrl == Ctrl::Stop {
+            break 'session;
+        }
+
+        if reached_eof && ctrl == Ctrl::Run {
+            finished_naturally = true;
+            break 'session;
+        }
+
+        if ctrl == Ctrl::Pause {
+            // Build partial video for download, keep frames for resume.
+            let (output_url, assemble_error) = if processed > 0 {
+                match assemble_annotated_video(
+                    &state.root,
+                    &job_id,
+                    &frames_dir,
+                    process_fps,
+                    false,
+                )
+                .await
+                {
+                    Ok(url) => {
+                        last_export_url = Some(url.clone());
+                        (Some(url), None)
+                    }
+                    Err(e) => (None, Some(e)),
+                }
+            } else {
+                (None, Some("No frames processed yet".into()))
+            };
+
+            let progress = progress_value(processed, expected_frames, false);
+            let _ = sender
+                .send(Message::Text(
+                    json!({
+                        "type": "paused",
+                        "processed": processed,
+                        "expected_frames": expected_frames,
+                        "progress": progress,
+                        "output": output_url,
+                        "error": assemble_error,
+                        "can_resume": processed < expected_frames && !finished_naturally,
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await;
+
+            // Wait for resume / stop / export
+            loop {
+                match receiver.next().await {
+                    Some(Ok(Message::Text(t))) => {
+                        let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else {
+                            continue;
+                        };
+                        match v.get("type").and_then(|x| x.as_str()) {
+                            Some("resume") => {
+                                let _ = sender
+                                    .send(Message::Text(
+                                        json!({
+                                            "type": "resumed",
+                                            "processed": processed,
+                                            "expected_frames": expected_frames,
+                                            "progress": progress_value(processed, expected_frames, false),
+                                        })
+                                        .to_string()
+                                        .into(),
+                                    ))
+                                    .await;
+                                continue 'session;
+                            }
+                            Some("stop") => break 'session,
+                            Some("export") => {
+                                if processed > 0 {
+                                    if let Ok(url) = assemble_annotated_video(
+                                        &state.root,
+                                        &job_id,
+                                        &frames_dir,
+                                        process_fps,
+                                        false,
+                                    )
+                                    .await
+                                    {
+                                        last_export_url = Some(url.clone());
+                                        let _ = sender
+                                            .send(Message::Text(
+                                                json!({
+                                                    "type": "export_ready",
+                                                    "output": url,
+                                                    "processed": processed,
+                                                    "expected_frames": expected_frames,
+                                                    "progress": progress_value(processed, expected_frames, false),
+                                                    "partial": true,
+                                                })
+                                                .to_string()
+                                                .into(),
+                                            ))
+                                            .await;
+                                    }
+                                }
+                            }
+                            Some("config") => {
+                                if let Some(c) = v.get("confidence").and_then(|c| c.as_f64()) {
+                                    state.detector.lock().await.set_confidence(c as f32);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break 'session,
+                    _ => {}
+                }
             }
         }
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
-
-    // Assemble annotated video if we have frames
-    let out_video = state
-        .root
-        .join("outputs")
-        .join(format!("{job_id}_annotated.mp4"));
-    let mut output_url: Option<String> = None;
-    let mut assemble_error: Option<String> = None;
-
+    // Final assembly (partial or complete)
+    let mut output_url = last_export_url;
+    let mut assemble_error = None;
     if processed > 0 {
-        let pattern = frames_dir.join("frame_%06d.jpg");
-        let fps = target_fps.min(src_fps.max(1.0));
-        // scale=... forces even dims (yuv420p / libx264 requirement)
-        let vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2".to_string();
-        let pattern_s = pattern.to_string_lossy().to_string();
-        let out_s = out_video.to_string_lossy().to_string();
-        let frames_dir_clone = frames_dir.clone();
-        let out_clone = out_video.clone();
-
-        let (ok, err_msg) = tokio::task::spawn_blocking(move || {
-            let output = Command::new("ffmpeg")
-                .args([
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-framerate",
-                    &format!("{fps:.3}"),
-                    "-i",
-                    &pattern_s,
-                    "-vf",
-                    &vf,
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-movflags",
-                    "+faststart",
-                    &out_s,
-                ])
-                .output();
-            match output {
-                Ok(o) if o.status.success() && out_clone.exists() => {
-                    let _ = std::fs::remove_dir_all(&frames_dir_clone);
-                    (true, None)
+        match assemble_annotated_video(&state.root, &job_id, &frames_dir, process_fps, true).await {
+            Ok(url) => output_url = Some(url),
+            Err(e) => {
+                if output_url.is_none() {
+                    assemble_error = Some(e);
                 }
-                Ok(o) => {
-                    let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                    (
-                        false,
-                        Some(if stderr.is_empty() {
-                            format!("ffmpeg exited with status {}", o.status)
-                        } else {
-                            stderr
-                        }),
-                    )
-                }
-                Err(e) => (false, Some(format!("ffmpeg spawn failed: {e}"))),
             }
-        })
-        .await
-        .unwrap_or((false, Some("assemble task join failed".into())));
-
-        if ok {
-            info!(
-                "Upload annotated video ready: {} ({} frames)",
-                out_video.display(),
-                processed
-            );
-            output_url = Some(format!("/api/download/{job_id}"));
-        } else {
-            error!("Annotated video assemble failed for {job_id}: {err_msg:?}");
-            assemble_error = err_msg;
-            // keep frames_dir for debugging if failed
         }
     } else {
         assemble_error = Some("No frames were processed".into());
@@ -829,6 +989,9 @@ async fn handle_video_ws(socket: WebSocket, state: AppState, job_id: String) {
             json!({
                 "type": "done",
                 "processed": processed,
+                "expected_frames": expected_frames,
+                "progress": 1.0,
+                "complete": finished_naturally,
                 "output": output_url,
                 "error": assemble_error,
             })
@@ -836,6 +999,120 @@ async fn handle_video_ws(socket: WebSocket, state: AppState, job_id: String) {
             .into(),
         ))
         .await;
+}
+
+fn progress_value(processed: u64, expected: u64, done: bool) -> f64 {
+    if done {
+        return 1.0;
+    }
+    if expected == 0 {
+        return 0.0;
+    }
+    // Never report 100% until the job is fully finished.
+    ((processed as f64) / (expected as f64)).clamp(0.0, 0.999)
+}
+
+
+fn spawn_frame_extractor(
+    video_path: &Path,
+    process_fps: f64,
+    start_sec: f64,
+) -> Result<std::process::Child, String> {
+    let mut args: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+    ];
+    // Accurate-ish seek before input for resume.
+    if start_sec > 0.05 {
+        args.push("-ss".into());
+        args.push(format!("{start_sec:.3}"));
+    }
+    args.extend([
+        "-i".into(),
+        video_path.to_string_lossy().to_string(),
+        "-vf".into(),
+        format!("fps={process_fps:.3}"),
+        "-f".into(),
+        "image2pipe".into(),
+        "-vcodec".into(),
+        "mjpeg".into(),
+        "-q:v".into(),
+        "5".into(),
+        "-".into(),
+    ]);
+
+    Command::new("ffmpeg")
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("ffmpeg failed: {e} (is ffmpeg installed?)"))
+}
+
+/// Assemble JPEG sequence into MP4. If `cleanup_frames`, deletes the frames dir on success.
+async fn assemble_annotated_video(
+    root: &Path,
+    job_id: &str,
+    frames_dir: &Path,
+    fps: f64,
+    cleanup_frames: bool,
+) -> Result<String, String> {
+    let out_video = root.join("outputs").join(format!("{job_id}_annotated.mp4"));
+    let pattern = frames_dir.join("frame_%06d.jpg");
+    let pattern_s = pattern.to_string_lossy().to_string();
+    let out_s = out_video.to_string_lossy().to_string();
+    let frames_dir = frames_dir.to_path_buf();
+    let out_clone = out_video.clone();
+    let fps = fps.clamp(1.0, 60.0);
+
+    let result = tokio::task::spawn_blocking(move || {
+        let output = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-framerate",
+                &format!("{fps:.3}"),
+                "-i",
+                &pattern_s,
+                "-vf",
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                &out_s,
+            ])
+            .output();
+        match output {
+            Ok(o) if o.status.success() && out_clone.exists() => {
+                if cleanup_frames {
+                    let _ = std::fs::remove_dir_all(&frames_dir);
+                }
+                Ok(())
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                Err(if stderr.is_empty() {
+                    format!("ffmpeg exited with status {}", o.status)
+                } else {
+                    stderr
+                })
+            }
+            Err(e) => Err(format!("ffmpeg spawn failed: {e}")),
+        }
+    })
+    .await
+    .map_err(|e| format!("assemble join: {e}"))?;
+
+    result?;
+    Ok(format!("/api/download/{job_id}"))
 }
 
 fn find_upload(dir: &Path, job_id: &str) -> Option<PathBuf> {
@@ -857,53 +1134,116 @@ fn find_jpeg(buf: &[u8]) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-fn probe_video(path: &Path) -> (f64, u64, u32, u32) {
-    let output = Command::new("ffprobe")
+#[derive(Debug, Clone)]
+struct VideoMeta {
+    fps: f64,
+    frames: u64,
+    width: u32,
+    height: u32,
+    duration_s: f64,
+}
+
+fn probe_video_meta(path: &Path) -> VideoMeta {
+    let path_s = path.to_str().unwrap_or("");
+    let stream_out = Command::new("ffprobe")
         .args([
             "-v",
             "error",
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=width,height,r_frame_rate,nb_frames",
+            "stream=width,height,r_frame_rate,nb_frames,duration",
             "-of",
             "json",
-            path.to_str().unwrap_or(""),
+            path_s,
+        ])
+        .output();
+    let format_out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+            path_s,
         ])
         .output();
 
-    let Ok(out) = output else {
-        return (0.0, 0, 0, 0);
+    let mut meta = VideoMeta {
+        fps: 0.0,
+        frames: 0,
+        width: 0,
+        height: 0,
+        duration_s: 0.0,
     };
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or(json!({}));
-    let stream = v
-        .get("streams")
-        .and_then(|s| s.as_array())
-        .and_then(|a| a.first())
-        .cloned()
-        .unwrap_or(json!({}));
 
-    let width = stream.get("width").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-    let height = stream.get("height").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-    let frames = stream
-        .get("nb_frames")
-        .and_then(|x| x.as_str())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0u64);
-    let fps = stream
-        .get("r_frame_rate")
-        .and_then(|x| x.as_str())
-        .and_then(|s| {
-            let mut parts = s.split('/');
-            let n: f64 = parts.next()?.parse().ok()?;
-            let d: f64 = parts.next().unwrap_or("1").parse().ok()?;
-            if d == 0.0 {
-                None
-            } else {
-                Some(n / d)
+    if let Ok(out) = stream_out {
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or(json!({}));
+        let stream = v
+            .get("streams")
+            .and_then(|s| s.as_array())
+            .and_then(|a| a.first())
+            .cloned()
+            .unwrap_or(json!({}));
+        meta.width = stream.get("width").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+        meta.height = stream.get("height").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+        meta.frames = stream
+            .get("nb_frames")
+            .and_then(|x| x.as_str())
+            .and_then(|s| s.parse().ok())
+            .or_else(|| stream.get("nb_frames").and_then(|x| x.as_u64()))
+            .unwrap_or(0);
+        meta.fps = stream
+            .get("r_frame_rate")
+            .and_then(|x| x.as_str())
+            .and_then(|s| {
+                let mut parts = s.split('/');
+                let n: f64 = parts.next()?.parse().ok()?;
+                let d: f64 = parts.next().unwrap_or("1").parse().ok()?;
+                if d == 0.0 {
+                    None
+                } else {
+                    Some(n / d)
+                }
+            })
+            .unwrap_or(0.0);
+        if let Some(d) = stream
+            .get("duration")
+            .and_then(|x| x.as_str())
+            .and_then(|s| s.parse().ok())
+            .or_else(|| stream.get("duration").and_then(|x| x.as_f64()))
+        {
+            if d > 0.0 {
+                meta.duration_s = d;
             }
-        })
-        .unwrap_or(0.0);
+        }
+    }
 
-    (fps, frames, width, height)
+    if let Ok(out) = format_out {
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or(json!({}));
+        if let Some(d) = v
+            .pointer("/format/duration")
+            .and_then(|x| x.as_str())
+            .and_then(|s| s.parse().ok())
+            .or_else(|| v.pointer("/format/duration").and_then(|x| x.as_f64()))
+        {
+            if d > 0.0 {
+                meta.duration_s = d;
+            }
+        }
+    }
+
+    // Derive duration from frames if still missing
+    if meta.duration_s <= 0.0 && meta.frames > 0 && meta.fps > 0.0 {
+        meta.duration_s = meta.frames as f64 / meta.fps;
+    }
+
+    meta
+}
+
+/// Used by upload endpoint metadata.
+fn probe_video(path: &Path) -> (f64, u64, u32, u32) {
+    let m = probe_video_meta(path);
+    (m.fps, m.frames, m.width, m.height)
 }
