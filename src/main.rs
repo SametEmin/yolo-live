@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::extract::multipart::Multipart;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, State};
@@ -66,7 +67,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(index))
         .route("/api/health", get(health))
         .route("/api/confidence", post(set_confidence))
-        .route("/api/upload", post(upload_video))
+        .route(
+            "/api/upload",
+            post(upload_video).layer(DefaultBodyLimit::max(500 * 1024 * 1024)),
+        )
         .route("/api/download/{job_id}", get(download_annotated))
         .route("/ws/detect", get(ws_detect_upgrade))
         .route("/ws/video/{job_id}", get(ws_video_upgrade))
@@ -113,11 +117,32 @@ async fn upload_video(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
-    while let Ok(Some(field)) = multipart.next_field().await {
+    // Note: request body limit is raised on this route (500 MiB).
+    // Without that, Axum's default 2 MiB limit surfaces as:
+    // "Error parsing `multipart/form-data` request".
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => {
+                error!("multipart field error: {e}");
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": format!(
+                            "Failed to read upload ({e}). Large videos need the raised body limit; try again after restarting the server."
+                        )
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
         let name = field.name().unwrap_or("").to_string();
         if name != "file" {
             continue;
         }
+
         let filename = field
             .file_name()
             .map(|s| s.to_string())
@@ -136,26 +161,70 @@ async fn upload_video(
                 .into_response();
         }
 
-        let data = match field.bytes().await {
-            Ok(b) => b,
+        let job_id = Uuid::new_v4().simple().to_string()[..12].to_string();
+        let dest = state.root.join("uploads").join(format!("{job_id}.{ext}"));
+
+        // Stream chunks to disk (avoids holding whole video in RAM).
+        let mut file = match tokio::fs::File::create(&dest).await {
+            Ok(f) => f,
             Err(e) => {
                 return (
-                    axum::http::StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": e.to_string() })),
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("Cannot create upload file: {e}") })),
                 )
                     .into_response();
             }
         };
 
-        let job_id = Uuid::new_v4().simple().to_string()[..12].to_string();
-        let dest = state.root.join("uploads").join(format!("{job_id}.{ext}"));
-        if let Err(e) = std::fs::write(&dest, &data) {
+        let mut total: u64 = 0;
+        let mut field = field;
+        loop {
+            match field.chunk().await {
+                Ok(Some(chunk)) => {
+                    total += chunk.len() as u64;
+                    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await {
+                        let _ = tokio::fs::remove_file(&dest).await;
+                        return (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "error": format!("Write failed: {e}") })),
+                        )
+                            .into_response();
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&dest).await;
+                    error!("chunk read error: {e}");
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": format!(
+                                "Upload interrupted ({e}). If the file is large, restart the updated server and retry."
+                            )
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut file).await {
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": e.to_string() })),
             )
                 .into_response();
         }
+
+        if total == 0 {
+            let _ = tokio::fs::remove_file(&dest).await;
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Empty file" })),
+            )
+                .into_response();
+        }
+
+        info!("Saved upload {filename} → {} ({total} bytes)", dest.display());
 
         let (fps, frames, width, height) = probe_video(&dest);
         let duration_s = if fps > 0.0 {
@@ -168,6 +237,7 @@ async fn upload_video(
             "job_id": job_id,
             "filename": filename,
             "path": dest.file_name().and_then(|s| s.to_str()),
+            "bytes": total,
             "fps": fps,
             "frames": frames,
             "width": width,
@@ -179,7 +249,7 @@ async fn upload_video(
 
     (
         axum::http::StatusCode::BAD_REQUEST,
-        Json(json!({ "error": "No file field" })),
+        Json(json!({ "error": "No file field in form (expected name=\"file\")" })),
     )
         .into_response()
 }

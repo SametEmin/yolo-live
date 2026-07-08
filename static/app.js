@@ -182,8 +182,13 @@
       const form = new FormData();
       form.append("file", state.selectedFile);
       const res = await fetch("/api/upload", { method: "POST", body: form });
-      const meta = await res.json();
-      if (!res.ok) throw new Error(meta.error || "Upload failed");
+      let meta;
+      try {
+        meta = await res.json();
+      } catch (_) {
+        throw new Error(`Upload failed (HTTP ${res.status}). Is the server running the latest build?`);
+      }
+      if (!res.ok) throw new Error(meta.error || `Upload failed (HTTP ${res.status})`);
       state.jobId = meta.job_id;
       els.statusText.textContent = `Processing ${meta.filename}…`;
       const proto = location.protocol === "https:" ? "wss" : "ws";
