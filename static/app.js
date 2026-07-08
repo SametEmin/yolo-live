@@ -80,22 +80,35 @@
     els.progressBar.hidden = true;
     hideDownload();
     setRecordingUi(false, 0);
-    if (mode !== "upload") clearPreviewVideo();
+    // Always clear detection frame when switching modes.
+    if (els.outputFrame) {
+      els.outputFrame.hidden = true;
+      els.outputFrame.removeAttribute("src");
+    }
     updateControlVisibility();
     if (mode === "live") {
+      // Preview belongs only to Upload mode — never keep it on Live.
+      clearPreviewVideo();
       els.placeholderTitle.textContent = "Live camera mode";
       els.placeholderText.innerHTML =
         "Click <strong>Start</strong> to open your webcam. Annotated frames are recorded automatically — press <strong>Stop &amp; save</strong> to download the video.";
       els.btnStart.textContent = "Start camera";
       els.btnStop.textContent = "Stop & save";
+      showPlaceholder(true);
     } else {
       els.placeholderTitle.textContent = "Upload a video";
       els.placeholderText.innerHTML =
         "Choose a video, then <strong>Start detection</strong>. Use <strong>Pause</strong> / <strong>Resume</strong>, and download a partial annotated video anytime.";
       els.btnStart.textContent = "Start detection";
       els.btnStop.textContent = "Stop & save";
+      // Restore preview only in upload mode if a file is already selected.
+      if (state.selectedFile) {
+        showSelectedVideoPreview(state.selectedFile);
+      } else {
+        clearPreviewVideo();
+        showPlaceholder(true);
+      }
     }
-    showPlaceholder(true);
   }
 
   function updateControlVisibility() {
@@ -132,7 +145,11 @@
     state.selectedFile = f || null;
     els.fileName.textContent = f ? f.name : "No file selected";
     hideDownload();
-    showSelectedVideoPreview(f || null);
+    if (state.mode === "upload") {
+      showSelectedVideoPreview(f || null);
+    } else {
+      clearPreviewVideo();
+    }
   });
   els.btnStart.addEventListener("click", () =>
     state.mode === "live" ? startLive() : startUpload()
@@ -167,9 +184,16 @@
     if (show) {
       els.outputFrame.hidden = true;
       els.outputFrame.removeAttribute("src");
+      // Never leave a stuck preview under the placeholder (esp. Live mode).
+      if (state.mode !== "upload" && els.previewVideo) {
+        els.previewVideo.hidden = true;
+        els.previewVideo.pause();
+      }
     }
   }
+
   function showFrame(dataUrl) {
+    // Detection frames replace preview in the same stage slot.
     els.placeholder.hidden = true;
     if (els.previewVideo) {
       els.previewVideo.hidden = true;
@@ -183,7 +207,7 @@
     if (!els.previewVideo) return;
     els.previewVideo.pause();
     els.previewVideo.removeAttribute("src");
-    els.previewVideo.load();
+    try { els.previewVideo.load(); } catch (_) {}
     els.previewVideo.hidden = true;
     if (state.previewObjectUrl) {
       URL.revokeObjectURL(state.previewObjectUrl);
@@ -193,12 +217,17 @@
 
   function showSelectedVideoPreview(file) {
     if (!els.previewVideo) return;
-    clearPreviewVideo();
-    if (!file) {
-      if (state.mode === "upload") showPlaceholder(true);
+    // Only show uploaded file preview in Upload Video mode.
+    if (state.mode !== "upload") {
+      clearPreviewVideo();
       return;
     }
-    // Show the chosen file on the stage before detection starts.
+    clearPreviewVideo();
+    if (!file) {
+      showPlaceholder(true);
+      return;
+    }
+    // Same stage area as detection (#stage grid cell).
     const url = URL.createObjectURL(file);
     state.previewObjectUrl = url;
     els.previewVideo.src = url;
@@ -208,7 +237,7 @@
     els.placeholder.hidden = true;
     els.previewVideo.currentTime = 0;
     els.previewVideo.play().catch(() => {
-      // Autoplay may be blocked; controls are available for manual play.
+      // Autoplay may be blocked; controls allow manual play.
     });
     els.statusText.textContent = `Selected: ${file.name}`;
   }
@@ -400,6 +429,7 @@
 
   async function startLive() {
     try {
+      clearPreviewVideo();
       hideDownload();
       setRecordingUi(false, 0);
       els.statusText.textContent = "Requesting camera…";

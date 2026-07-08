@@ -145,9 +145,38 @@ body {
   position: relative; flex: 1; min-height: 420px; background: #05060a;
   display: grid; place-items: center; overflow: hidden;
 }
+/* All media occupy the same stage cell so preview and detection align. */
+.stage > #webcam,
+.stage > #previewVideo,
+.stage > #outputFrame,
+.stage > #placeholder {
+  grid-area: 1 / 1;
+  max-width: 100%;
+  max-height: 100%;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
 #outputFrame {
-  max-width: 100%; max-height: 100%; width: 100%; height: 100%;
-  object-fit: contain; display: block; background: #05060a;
+  object-fit: contain;
+  background: #05060a;
+  z-index: 2;
+}
+#outputFrame:not([hidden]) {
+  display: block;
+}
+#previewVideo:not([hidden]) {
+  display: block;
+  object-fit: contain;
+  background: #05060a;
+  z-index: 2;
+}
+/* Critical: ID rules must not override the HTML hidden attribute. */
+#previewVideo[hidden],
+#outputFrame[hidden],
+#webcam[hidden],
+#placeholder[hidden] {
+  display: none !important;
 }
 .placeholder { text-align: center; padding: 32px; max-width: 420px; color: var(--text-muted); }
 .placeholder-icon {
@@ -317,12 +346,7 @@ body {
   box-shadow: 0 4px 14px rgba(245, 165, 36, 0.3);
 }
 
-#previewVideo {
-  max-width: 100%;
-  max-height: 100%;
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-  display: block;
-  background: #05060a;
+
+.bottom-bar .upload-zone[hidden] {
+  display: none !important;
 }
