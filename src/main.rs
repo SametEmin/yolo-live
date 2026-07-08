@@ -2,6 +2,7 @@
 
 mod coco;
 mod detector;
+mod pipeline;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,7 @@ use axum::Router;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use detector::ObjectDetector;
+use pipeline::{run_benchmark, DetectionPipeline};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
@@ -28,8 +30,12 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 struct AppState {
+    /// Sequential path (video upload / baseline).
     detector: Arc<Mutex<ObjectDetector>>,
+    /// Multi-thread pipeline: capture | preprocess | inference | render.
+    pipeline: Arc<DetectionPipeline>,
     root: PathBuf,
+    model_path: PathBuf,
 }
 
 #[tokio::main]
@@ -47,19 +53,27 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(root.join("models"))?;
 
     let model_path = root.join("models/yolo11n.onnx");
-    info!("Initializing YOLO detector…");
-    let detector = tokio::task::spawn_blocking(move || ObjectDetector::load(model_path))
+    let model_path_seq = model_path.clone();
+    let model_path_pipe = model_path.clone();
+    info!("Initializing YOLO detectors (sequential + 4-thread pipeline)…");
+    let detector = tokio::task::spawn_blocking(move || ObjectDetector::load(model_path_seq))
+        .await??;
+    let pipe_det = tokio::task::spawn_blocking(move || ObjectDetector::load(model_path_pipe))
+        .await??;
+    let pipeline = tokio::task::spawn_blocking(move || DetectionPipeline::start(pipe_det))
         .await??;
 
     info!(
-        "Ready · device={} · model={}",
+        "Ready · device={} · model={} · pipeline threads=4",
         detector.device(),
         detector.model_name()
     );
 
     let state = AppState {
         detector: Arc::new(Mutex::new(detector)),
+        pipeline: Arc::new(pipeline),
         root: root.clone(),
+        model_path: model_path.clone(),
     };
 
     let static_dir = root.join("static");
@@ -67,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(index))
         .route("/api/health", get(health))
         .route("/api/confidence", post(set_confidence))
+        .route("/api/benchmark", get(benchmark))
         .route(
             "/api/upload",
             post(upload_video).layer(DefaultBodyLimit::max(500 * 1024 * 1024)),
@@ -95,7 +110,13 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "device": det.device(),
         "model": det.model_name(),
         "confidence": det.confidence(),
-        "language": "rust"
+        "language": "rust",
+        "pipeline": {
+            "enabled": true,
+            "threads": ["capture", "preprocess", "inference", "render"],
+            "device": state.pipeline.device(),
+            "confidence": state.pipeline.confidence(),
+        }
     }))
 }
 
@@ -110,7 +131,35 @@ async fn set_confidence(
 ) -> impl IntoResponse {
     let mut det = state.detector.lock().await;
     det.set_confidence(body.confidence);
+    state.pipeline.set_confidence(body.confidence);
     Json(json!({ "confidence": det.confidence() }))
+}
+
+/// Compare single-thread vs 4-thread pipeline average FPS.
+async fn benchmark(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let frames: u32 = q
+        .get("frames")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(48)
+        .clamp(10, 200);
+    let model_path = state.model_path.clone();
+    info!("Running FPS benchmark frames={frames}…");
+    match tokio::task::spawn_blocking(move || run_benchmark(&model_path, frames)).await {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(e)) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn upload_video(
@@ -380,8 +429,9 @@ async fn handle_live_ws(socket: WebSocket, state: AppState) {
             Some("config") => {
                 if let Some(c) = v.get("confidence").and_then(|c| c.as_f64()) {
                     state.detector.lock().await.set_confidence(c as f32);
+                    state.pipeline.set_confidence(c as f32);
                 }
-                let conf = state.detector.lock().await.confidence();
+                let conf = state.pipeline.confidence();
                 let _ = sender
                     .send(Message::Text(
                         json!({"type":"config_ok","confidence": conf}).to_string().into(),
@@ -417,77 +467,63 @@ async fn handle_live_ws(socket: WebSocket, state: AppState) {
                     continue;
                 };
 
-                let det = state.detector.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    let mut d = det.blocking_lock();
-                    d.predict_jpeg(&raw)
-                })
-                .await;
+                // Stage 1 input: push into multi-thread pipeline (capture thread).
+                state.pipeline.submit_capture(raw);
 
-                match result {
-                    Ok(Ok((jpeg, meta))) => {
-                        if recording_active {
-                            // Skip leading black / empty camera frames so the exported
-                            // video does not open on a black screen.
-                            let black = jpeg_is_mostly_black(&jpeg);
-                            if black {
-                                recording.good_streak = 0;
-                            } else {
-                                recording.good_streak = recording.good_streak.saturating_add(1);
-                            }
-
-                            // Require 2 consecutive non-black frames before first write.
-                            if !recording.content_started {
-                                if recording.good_streak >= 2 {
-                                    recording.content_started = true;
-                                }
-                            }
-
-                            if recording.content_started && !black {
-                                recording.frame_count += 1;
-                                if meta.fps > 1.0 {
-                                    recording.fps =
-                                        0.8 * recording.fps + 0.2 * meta.fps.max(5.0);
-                                }
-                                let fp = recording
-                                    .frames_dir
-                                    .join(format!("frame_{:06}.jpg", recording.frame_count));
-                                let _ = std::fs::write(&fp, &jpeg);
-                            }
+                // Drain any completed frames (render thread outputs).
+                while let Some(out) = state.pipeline.try_recv() {
+                    let jpeg = out.jpeg;
+                    let meta = out.meta;
+                    if recording_active {
+                        let black = jpeg_is_mostly_black(&jpeg);
+                        if black {
+                            recording.good_streak = 0;
+                        } else {
+                            recording.good_streak = recording.good_streak.saturating_add(1);
                         }
-
-                        let frame = format!("data:image/jpeg;base64,{}", B64.encode(&jpeg));
-                        let payload = json!({
-                            "type": "result",
-                            "frame": frame,
-                            "detections": meta.detections,
-                            "summary": meta.summary,
-                            "fps": meta.fps,
-                            "inference_ms": meta.inference_ms,
-                            "device": meta.device,
-                            "count": meta.count,
-                            "recording": recording_active && recording.content_started,
-                            "recorded_frames": recording.frame_count,
-                        });
-                        if sender
-                            .send(Message::Text(payload.to_string().into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
+                        if !recording.content_started && recording.good_streak >= 2 {
+                            recording.content_started = true;
+                        }
+                        if recording.content_started && !black {
+                            recording.frame_count += 1;
+                            if meta.fps > 1.0 {
+                                recording.fps =
+                                    0.8 * recording.fps + 0.2 * meta.fps.max(5.0);
+                            }
+                            let fp = recording
+                                .frames_dir
+                                .join(format!("frame_{:06}.jpg", recording.frame_count));
+                            let _ = std::fs::write(&fp, &jpeg);
                         }
                     }
-                    Ok(Err(e)) => {
-                        error!("inference error: {e:#}");
-                        let _ = sender
-                            .send(Message::Text(
-                                json!({"type":"error","message": e.to_string()})
-                                    .to_string()
-                                    .into(),
-                            ))
-                            .await;
+
+                    let frame = format!("data:image/jpeg;base64,{}", B64.encode(&jpeg));
+                    let payload = json!({
+                        "type": "result",
+                        "frame": frame,
+                        "detections": meta.detections,
+                        "summary": meta.summary,
+                        "fps": meta.fps,
+                        "inference_ms": meta.inference_ms,
+                        "device": meta.device,
+                        "count": meta.count,
+                        "recording": recording_active && recording.content_started,
+                        "recorded_frames": recording.frame_count,
+                        "pipeline": true,
+                        "stage_ms": {
+                            "capture": out.stage_ms.capture_ms,
+                            "preprocess": out.stage_ms.preprocess_ms,
+                            "inference": out.stage_ms.inference_ms,
+                            "render": out.stage_ms.render_ms,
+                        }
+                    });
+                    if sender
+                        .send(Message::Text(payload.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
                     }
-                    Err(e) => error!("join error: {e}"),
                 }
             }
             _ => {}

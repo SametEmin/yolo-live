@@ -136,7 +136,11 @@
     </main>
 
     <footer class="footer">
-      <span>Rust · ONNX Runtime · CoreML · YOLO11n</span>
+      <span>Rust · 4-thread pipeline · CoreML · YOLO11n</span>
+      <div class="bench-row">
+        <button type="button" class="btn secondary" id="btnBenchmark">Compare FPS (before/after MT)</button>
+        <span id="benchResult" class="bench-result mono"></span>
+      </div>
       <span id="statusText">Idle</span>
     </footer>
   </div>

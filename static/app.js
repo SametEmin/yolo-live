@@ -36,6 +36,8 @@
     progressLabel: $("progressLabel"),
     recordPill: $("recordPill"),
     recFrames: $("recFrames"),
+    btnBenchmark: $("btnBenchmark"),
+    benchResult: $("benchResult"),
   };
 
   const state = {
@@ -786,6 +788,33 @@
     setRunningFlags({ running: false, paused: false });
     setRecordingUi(false, 0);
     if (!pendingDownloadUrl) els.statusText.textContent = "Stopped";
+  }
+
+  if (els.btnBenchmark) {
+    els.btnBenchmark.addEventListener("click", async () => {
+      els.btnBenchmark.disabled = true;
+      els.btnBenchmark.textContent = "Running benchmark…";
+      if (els.benchResult) els.benchResult.textContent = "Measuring single-thread vs 4-thread pipeline…";
+      els.statusText.textContent = "FPS benchmark running (may take ~1 min)…";
+      try {
+        const res = await fetch("/api/benchmark?frames=48");
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Benchmark failed");
+        const b = data.before;
+        const a = data.after;
+        const line = `Before ${b.avg_fps} FPS (1 thread) → After ${a.avg_fps} FPS (4 threads) · speedup ${data.speedup_x}× · device ${data.device}`;
+        if (els.benchResult) els.benchResult.textContent = line;
+        els.statusText.textContent = line;
+        console.log("benchmark", data);
+      } catch (e) {
+        console.error(e);
+        if (els.benchResult) els.benchResult.textContent = e.message || "Benchmark failed";
+        els.statusText.textContent = e.message || "Benchmark failed";
+      } finally {
+        els.btnBenchmark.disabled = false;
+        els.btnBenchmark.textContent = "Compare FPS (before/after MT)";
+      }
+    });
   }
 
   setMode("live");

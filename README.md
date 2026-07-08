@@ -63,3 +63,27 @@ yolo-live/
 ## License
 
 MIT
+
+## Multi-threaded pipeline
+
+Live detection runs a **4-stage OS-thread pipeline**:
+
+| Thread | Stage |
+|--------|--------|
+| `yolo-capture` | JPEG decode (camera / network frames) |
+| `yolo-preprocess` | Letterbox + NCHW tensor |
+| `yolo-inference` | YOLO11 ONNX (CoreML) |
+| `yolo-render` | Draw boxes + JPEG encode |
+
+Upload-video processing still uses the sequential path for simplicity; live uses the pipeline.
+
+### FPS benchmark (before vs after)
+
+In the UI footer click **Compare FPS (before/after MT)**, or:
+
+```bash
+curl "http://127.0.0.1:8000/api/benchmark?frames=48"
+```
+
+`before` = single-thread sequential `predict_jpeg`  
+`after` = 4-thread pipeline throughput  

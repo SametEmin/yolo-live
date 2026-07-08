@@ -350,3 +350,11 @@ body {
 .bottom-bar .upload-zone[hidden] {
   display: none !important;
 }
+
+.footer { flex-wrap: wrap; gap: 10px; }
+.bench-row {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+.bench-result {
+  font-size: 0.75rem; color: var(--accent-2); max-width: 520px;
+}

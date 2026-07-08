@@ -152,40 +152,56 @@ impl ObjectDetector {
         self.conf = conf.clamp(0.05, 0.95);
     }
 
+    pub fn font(&self) -> &FontArc {
+        &self.font
+    }
+
+    /// Single-threaded end-to-end (baseline): capture → preprocess → infer → render.
     pub fn predict_jpeg(&mut self, jpeg_bytes: &[u8]) -> Result<(Vec<u8>, FrameResult)> {
-        let img = image::load_from_memory(jpeg_bytes).context("decode jpeg")?;
-        let (annotated, meta) = self.predict_image(&img)?;
-        let mut buf = Vec::new();
-        {
-            let mut cursor = std::io::Cursor::new(&mut buf);
-            let rgb = annotated.to_rgb8();
-            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 80);
-            encoder
-                .encode(
-                    rgb.as_raw(),
-                    rgb.width(),
-                    rgb.height(),
-                    image::ExtendedColorType::Rgb8,
-                )
-                .context("encode jpeg")?;
-        }
-        Ok((buf, meta))
+        let rgb = stage_capture_decode(jpeg_bytes)?;
+        let prepared = stage_preprocess(rgb);
+        let (dets, inference_ms) = self.stage_inference(&prepared)?;
+        self.note_fps();
+        stage_render(
+            prepared.rgb,
+            &dets,
+            &self.font,
+            &self.device,
+            inference_ms,
+            self.fps,
+        )
     }
 
     pub fn predict_image(&mut self, img: &DynamicImage) -> Result<(DynamicImage, FrameResult)> {
         let rgb = img.to_rgb8();
-        let (orig_w, orig_h) = (rgb.width(), rgb.height());
+        let prepared = stage_preprocess(rgb);
+        let (dets, inference_ms) = self.stage_inference(&prepared)?;
+        self.note_fps();
+        let (jpeg, meta) = stage_render(
+            prepared.rgb,
+            &dets,
+            &self.font,
+            &self.device,
+            inference_ms,
+            self.fps,
+        )?;
+        let annotated = image::load_from_memory(&jpeg).context("reload annotated")?;
+        let _ = jpeg;
+        Ok((annotated, meta))
+    }
 
-        let (input, meta) = letterbox(&rgb, INPUT_SIZE);
-        let tensor = Array4::from_shape_fn(
-            (1, 3, INPUT_SIZE as usize, INPUT_SIZE as usize),
-            |(_, c, y, x)| input[(x as u32, y as u32)][c] as f32 / 255.0,
-        );
-
+    /// Stage 3 — Inference (must run on the thread that owns the ONNX session).
+    pub fn stage_inference(
+        &mut self,
+        prepared: &PreprocessedFrame,
+    ) -> Result<(Vec<Detection>, f32)> {
         let t0 = Instant::now();
         let shape = [1i64, 3, INPUT_SIZE as i64, INPUT_SIZE as i64];
-        let input_ref =
-            TensorRef::from_array_view((shape, tensor.as_slice().unwrap())).map_err(ort_err)?;
+        let input_ref = TensorRef::from_array_view((
+            shape,
+            prepared.tensor.as_slice().unwrap(),
+        ))
+        .map_err(ort_err)?;
         let outputs = self.session.run(ort::inputs![input_ref]).map_err(ort_err)?;
         let inference_ms = t0.elapsed().as_secs_f32() * 1000.0;
 
@@ -195,16 +211,16 @@ impl ObjectDetector {
         let detections = postprocess(
             data,
             &shape_vec,
-            &meta,
-            orig_w,
-            orig_h,
+            &prepared.letterbox,
+            prepared.orig_w,
+            prepared.orig_h,
             self.conf,
             self.iou,
         )?;
+        Ok((detections, inference_ms))
+    }
 
-        let mut annotated = rgb;
-        draw_detections(&mut annotated, &detections, &self.font);
-
+    fn note_fps(&mut self) {
         let now = Instant::now();
         let dt = now.duration_since(self.last_instant).as_secs_f32();
         self.last_instant = now;
@@ -216,26 +232,84 @@ impl ObjectDetector {
                 0.85 * self.fps + 0.15 * instant
             };
         }
-
-        let summary = summarize(&detections);
-        let count = detections.len();
-        let result = FrameResult {
-            detections,
-            summary,
-            fps: (self.fps * 10.0).round() / 10.0,
-            inference_ms: (inference_ms * 10.0).round() / 10.0,
-            device: self.device.clone(),
-            count,
-        };
-
-        Ok((DynamicImage::ImageRgb8(annotated), result))
     }
 }
 
-struct LetterboxMeta {
-    scale: f32,
-    pad_x: f32,
-    pad_y: f32,
+#[derive(Debug, Clone)]
+pub struct LetterboxMeta {
+    pub scale: f32,
+    pub pad_x: f32,
+    pub pad_y: f32,
+}
+
+/// Output of the preprocessing stage (letterbox + NCHW tensor).
+pub struct PreprocessedFrame {
+    pub rgb: RgbImage,
+    pub tensor: Array4<f32>,
+    pub letterbox: LetterboxMeta,
+    pub orig_w: u32,
+    pub orig_h: u32,
+}
+
+// ─── Pipeline stages (used by multi-threaded pipeline) ─────────────────────
+
+/// Stage 1 — Capture: decode camera / network JPEG bytes to RGB.
+pub fn stage_capture_decode(jpeg_bytes: &[u8]) -> Result<RgbImage> {
+    let img = image::load_from_memory(jpeg_bytes).context("decode jpeg")?;
+    Ok(img.to_rgb8())
+}
+
+/// Stage 2 — Preprocessing: letterbox resize + normalize to NCHW float tensor.
+pub fn stage_preprocess(rgb: RgbImage) -> PreprocessedFrame {
+    let (orig_w, orig_h) = (rgb.width(), rgb.height());
+    let (input, letterbox) = letterbox(&rgb, INPUT_SIZE);
+    let tensor = Array4::from_shape_fn(
+        (1, 3, INPUT_SIZE as usize, INPUT_SIZE as usize),
+        |(_, c, y, x)| input[(x as u32, y as u32)][c] as f32 / 255.0,
+    );
+    PreprocessedFrame {
+        rgb,
+        tensor,
+        letterbox,
+        orig_w,
+        orig_h,
+    }
+}
+
+/// Stage 4 — Rendering: draw boxes and encode JPEG (does not need the session).
+pub fn stage_render(
+    mut rgb: RgbImage,
+    detections: &[Detection],
+    font: &FontArc,
+    device: &str,
+    inference_ms: f32,
+    pipeline_fps: f32,
+) -> Result<(Vec<u8>, FrameResult)> {
+    draw_detections(&mut rgb, detections, font);
+    let summary = summarize(detections);
+    let count = detections.len();
+    let result = FrameResult {
+        detections: detections.to_vec(),
+        summary,
+        fps: (pipeline_fps * 10.0).round() / 10.0,
+        inference_ms: (inference_ms * 10.0).round() / 10.0,
+        device: device.to_string(),
+        count,
+    };
+    let mut buf = Vec::new();
+    {
+        let mut cursor = std::io::Cursor::new(&mut buf);
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 80);
+        encoder
+            .encode(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .context("encode jpeg")?;
+    }
+    Ok((buf, result))
 }
 
 fn letterbox(img: &RgbImage, size: u32) -> (RgbImage, LetterboxMeta) {
