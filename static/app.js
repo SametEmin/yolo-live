@@ -491,9 +491,9 @@
         );
         setRunningFlags({ running: true });
         // Drop first frames so the export does not begin on a black camera warm-up.
-        state.liveWarmupLeft = 8;
+        state.liveWarmupLeft = 4;
         state.inFlight = 0;
-        els.statusText.textContent = "Live detection · waiting for camera…";
+        els.statusText.textContent = "Live detection · starting pipeline…";
         showPlaceholder(false);
         setRecordingUi(true, 0);
         pumpLiveFrames();
@@ -502,13 +502,14 @@
         const data = JSON.parse(ev.data);
         if (data.type === "result") {
           state.busyFrame = false;
-          state.inFlight = Math.max(0, (state.inFlight || 0) - 1);
+          state.inFlight = 0;
           showFrame(data.frame);
           renderResults(data);
-          els.statusText.textContent = `Live · ${Number(data.fps || 0).toFixed(1)} FPS · ${data.count || 0} objects`;
+          const fps = Number(data.fps || 0);
+          els.statusText.textContent = `Live · ${fps.toFixed(1)} FPS · ${data.count || 0} objects · MT`;
         } else if (data.type === "recording_started") {
           setRecordingUi(true, 0);
-          els.statusText.textContent = "Live · REC on";
+          els.statusText.textContent = "Live · multi-thread pipeline";
         } else if (data.type === "recording_ready") {
           setRecordingUi(false, data.frames || 0);
           if (data.output) {
@@ -540,84 +541,65 @@
   }
 
   function pumpLiveFrames() {
+    // Low-latency live capture:
+    // - Send frames at ~30 FPS without waiting for server results
+    // - Server keeps only the latest frame (no queue lag)
+    // - Display every annotated result as soon as it arrives
+    const TARGET_INTERVAL_MS = 33; // ~30 FPS capture rate
+    let lastSend = 0;
+
     const tick = () => {
-      if (!state.running || state.stopping || !state.ws || state.ws.readyState !== WebSocket.OPEN)
+      if (!state.running || state.stopping || !state.ws || state.ws.readyState !== WebSocket.OPEN) {
         return;
+      }
       const video = els.webcam;
-      // Limit in-flight frames so we don't flood the server, but never deadlock
-      // waiting for a result before sending the next frame (pipeline is async).
-      const inFlight = state.inFlight || 0;
-      const maxIn = state.maxInFlight || 2;
+      const now = performance.now();
       if (
-        inFlight < maxIn &&
         video.readyState >= 2 &&
         video.videoWidth >= 16 &&
         video.videoHeight >= 16 &&
-        !video.paused
+        !video.paused &&
+        now - lastSend >= TARGET_INTERVAL_MS
       ) {
         if (state.liveWarmupLeft > 0) {
           state.liveWarmupLeft -= 1;
-          if (state.liveWarmupLeft > 0) {
-            // Draw raw camera to the stage during warm-up so the user sees something.
-            try {
-              const canvas = els.captureCanvas;
-              canvas.width = Math.min(960, video.videoWidth);
-              canvas.height = Math.round(
-                (video.videoHeight * canvas.width) / video.videoWidth
-              );
-              canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
-              showFrame(canvas.toDataURL("image/jpeg", 0.7));
-            } catch (_) {}
-            state.loopId = requestAnimationFrame(tick);
-            return;
-          }
-          els.statusText.textContent = "Live detection running";
-        }
-        const canvas = els.captureCanvas;
-        const maxW = 960;
-        const scale = Math.min(1, maxW / video.videoWidth);
-        canvas.width = Math.round(video.videoWidth * scale);
-        canvas.height = Math.round(video.videoHeight * scale);
-        const ctx = canvas.getContext("2d");
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-        // Soft black skip — only for the first few recorded frames, not forever.
-        // (A strict threshold previously blocked dim rooms / backlit scenes.)
-        let tooDark = false;
-        if ((state.liveWarmupLeft || 0) === 0 && (state.inFlight || 0) === 0) {
+          // Always show raw camera during warm-up so UI is never black/stuck.
           try {
-            const sample = ctx.getImageData(
-              Math.floor(canvas.width / 4),
-              Math.floor(canvas.height / 4),
-              Math.max(1, Math.floor(canvas.width / 2)),
-              Math.max(1, Math.floor(canvas.height / 2))
-            ).data;
-            let sum = 0;
-            let n = 0;
-            for (let i = 0; i < sample.length; i += 64) {
-              sum += sample[i] + sample[i + 1] + sample[i + 2];
-              n += 3;
+            const canvas = els.captureCanvas;
+            const maxW = 640;
+            const scale = Math.min(1, maxW / video.videoWidth);
+            canvas.width = Math.round(video.videoWidth * scale);
+            canvas.height = Math.round(video.videoHeight * scale);
+            canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+            // Prefer showing live camera until detections stream in.
+            if (els.outputFrame.hidden || !els.outputFrame.src) {
+              showFrame(canvas.toDataURL("image/jpeg", 0.65));
             }
-            const mean = n ? sum / n : 0;
-            // Only skip pure black frames (sensor not ready).
-            tooDark = mean < 6;
           } catch (_) {}
-        }
-        if (!tooDark) {
-          state.inFlight = inFlight + 1;
-          state.busyFrame = true;
-          try {
-            state.ws.send(
-              JSON.stringify({ type: "frame", frame: canvas.toDataURL("image/jpeg", 0.72) })
-            );
-          } catch (_) {
-            state.inFlight = Math.max(0, state.inFlight - 1);
+          if (state.liveWarmupLeft === 0) {
+            els.statusText.textContent = "Live detection · multi-thread pipeline";
           }
-          // Safety: if a result never arrives, free a slot after 1.5s.
-          setTimeout(() => {
-            if (state.inFlight > 0) state.inFlight = Math.max(0, state.inFlight - 1);
-            state.busyFrame = false;
-          }, 1500);
+        } else {
+          try {
+            const canvas = els.captureCanvas;
+            // 640px wide keeps encode + inference fast for 20+ FPS on M4.
+            const maxW = 640;
+            const scale = Math.min(1, maxW / video.videoWidth);
+            canvas.width = Math.round(video.videoWidth * scale) || 640;
+            canvas.height = Math.round(video.videoHeight * scale) || 480;
+            canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+            // If the socket is congested, skip this capture so we never queue lag.
+            if (state.ws.bufferedAmount > 350000) {
+              lastSend = now;
+            } else {
+              const dataUrl = canvas.toDataURL("image/jpeg", 0.62);
+              // Fire-and-forget: server overwrites with latest frame only.
+              state.ws.send(JSON.stringify({ type: "frame", frame: dataUrl }));
+              lastSend = now;
+            }
+          } catch (e) {
+            console.warn("live capture send failed", e);
+          }
         }
       }
       state.loopId = requestAnimationFrame(tick);

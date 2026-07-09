@@ -261,8 +261,20 @@ pub fn stage_capture_decode(jpeg_bytes: &[u8]) -> Result<RgbImage> {
 
 /// Stage 2 — Preprocessing: letterbox resize + normalize to NCHW float tensor.
 pub fn stage_preprocess(rgb: RgbImage) -> PreprocessedFrame {
+    stage_preprocess_with_filter(rgb, image::imageops::FilterType::Triangle)
+}
+
+/// Faster preprocess for live (Nearest filter) — targets 20+ FPS with low latency.
+pub fn stage_preprocess_fast(rgb: RgbImage) -> PreprocessedFrame {
+    stage_preprocess_with_filter(rgb, image::imageops::FilterType::Nearest)
+}
+
+fn stage_preprocess_with_filter(
+    rgb: RgbImage,
+    filter: image::imageops::FilterType,
+) -> PreprocessedFrame {
     let (orig_w, orig_h) = (rgb.width(), rgb.height());
-    let (input, letterbox) = letterbox(&rgb, INPUT_SIZE);
+    let (input, letterbox) = letterbox_with_filter(&rgb, INPUT_SIZE, filter);
     let tensor = Array4::from_shape_fn(
         (1, 3, INPUT_SIZE as usize, INPUT_SIZE as usize),
         |(_, c, y, x)| input[(x as u32, y as u32)][c] as f32 / 255.0,
@@ -278,12 +290,36 @@ pub fn stage_preprocess(rgb: RgbImage) -> PreprocessedFrame {
 
 /// Stage 4 — Rendering: draw boxes and encode JPEG (does not need the session).
 pub fn stage_render(
+    rgb: RgbImage,
+    detections: &[Detection],
+    font: &FontArc,
+    device: &str,
+    inference_ms: f32,
+    pipeline_fps: f32,
+) -> Result<(Vec<u8>, FrameResult)> {
+    stage_render_quality(rgb, detections, font, device, inference_ms, pipeline_fps, 80)
+}
+
+/// Live path: lower JPEG quality for faster encode / smaller WS payloads.
+pub fn stage_render_fast(
+    rgb: RgbImage,
+    detections: &[Detection],
+    font: &FontArc,
+    device: &str,
+    inference_ms: f32,
+    pipeline_fps: f32,
+) -> Result<(Vec<u8>, FrameResult)> {
+    stage_render_quality(rgb, detections, font, device, inference_ms, pipeline_fps, 65)
+}
+
+fn stage_render_quality(
     mut rgb: RgbImage,
     detections: &[Detection],
     font: &FontArc,
     device: &str,
     inference_ms: f32,
     pipeline_fps: f32,
+    jpeg_quality: u8,
 ) -> Result<(Vec<u8>, FrameResult)> {
     draw_detections(&mut rgb, detections, font);
     let summary = summarize(detections);
@@ -299,7 +335,8 @@ pub fn stage_render(
     let mut buf = Vec::new();
     {
         let mut cursor = std::io::Cursor::new(&mut buf);
-        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 80);
+        let mut encoder =
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, jpeg_quality);
         encoder
             .encode(
                 rgb.as_raw(),
@@ -312,12 +349,16 @@ pub fn stage_render(
     Ok((buf, result))
 }
 
-fn letterbox(img: &RgbImage, size: u32) -> (RgbImage, LetterboxMeta) {
+fn letterbox_with_filter(
+    img: &RgbImage,
+    size: u32,
+    filter: image::imageops::FilterType,
+) -> (RgbImage, LetterboxMeta) {
     let (w, h) = (img.width() as f32, img.height() as f32);
     let scale = (size as f32 / w).min(size as f32 / h);
     let nw = (w * scale).round().max(1.0) as u32;
     let nh = (h * scale).round().max(1.0) as u32;
-    let resized = image::imageops::resize(img, nw, nh, image::imageops::FilterType::Triangle);
+    let resized = image::imageops::resize(img, nw, nh, filter);
 
     let mut out = RgbImage::from_pixel(size, size, Rgb([114, 114, 114]));
     let pad_x = (size - nw) / 2;

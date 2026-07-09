@@ -401,20 +401,47 @@ async fn handle_live_ws(socket: WebSocket, state: AppState) {
             json!({
                 "type": "recording_started",
                 "job_id": recording.job_id,
-                "message": "Recording annotated live frames",
-                "pipeline": false,
+                "message": "Live multi-thread pipeline (latest-frame)",
+                "pipeline": true,
             })
             .to_string()
             .into(),
         ))
         .await;
 
-    // Live detection uses the *sequential* detector (same path as upload video).
-    // The multi-thread pipeline is reserved for benchmarks. Mixing pipeline queues
-    // with long upload jobs left live stuck on the first frame after upload.
-    //
-    // Tokio spawn_blocking still runs inference off the async executor.
-    while let Some(Ok(msg)) = receiver.next().await {
+    // Low-latency multi-thread pipeline (latest-frame slots).
+    // Always tracks the newest camera frame — never queues a backlog.
+    state.pipeline.set_live_fast(true);
+    state.pipeline.clear_pending();
+
+    let mut stop = false;
+    while !stop {
+        // Drain newest result(s); if several are ready, only keep the last
+        // so the UI never lags behind the camera.
+        let mut latest: Option<pipeline::PipelineOutput> = None;
+        while let Some(out) = state.pipeline.try_recv() {
+            latest = Some(out);
+        }
+        if let Some(out) = latest {
+            if send_live_result(&mut sender, &mut recording, recording_active, out)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+
+        let msg = match tokio::time::timeout(
+            std::time::Duration::from_millis(4),
+            receiver.next(),
+        )
+        .await
+        {
+            Ok(Some(Ok(m))) => m,
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => continue,
+        };
+
         let text = match msg {
             Message::Text(t) => t.to_string(),
             Message::Close(_) => break,
@@ -437,7 +464,7 @@ async fn handle_live_ws(socket: WebSocket, state: AppState) {
                     state.detector.lock().await.set_confidence(c as f32);
                     state.pipeline.set_confidence(c as f32);
                 }
-                let conf = state.detector.lock().await.confidence();
+                let conf = state.pipeline.confidence();
                 let _ = sender
                     .send(Message::Text(
                         json!({"type":"config_ok","confidence": conf}).to_string().into(),
@@ -445,6 +472,11 @@ async fn handle_live_ws(socket: WebSocket, state: AppState) {
                     .await;
             }
             Some("stop") | Some("record_stop") => {
+                // Flush last result
+                while let Some(out) = state.pipeline.try_recv() {
+                    let _ =
+                        send_live_result(&mut sender, &mut recording, recording_active, out).await;
+                }
                 if recording_active {
                     let out = finalize_live_recording(&state, &recording).await;
                     let _ = sender
@@ -461,7 +493,7 @@ async fn handle_live_ws(socket: WebSocket, state: AppState) {
                         .await;
                     recording_active = false;
                 }
-                break;
+                stop = true;
             }
             Some("frame") | None => {
                 let Some(b64) = v.get("frame").and_then(|f| f.as_str()) else {
@@ -471,45 +503,14 @@ async fn handle_live_ws(socket: WebSocket, state: AppState) {
                 let Ok(raw) = B64.decode(b64) else {
                     continue;
                 };
-
-                let det = state.detector.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    let mut d = det.blocking_lock();
-                    d.predict_jpeg(&raw)
-                })
-                .await;
-
-                match result {
-                    Ok(Ok((jpeg, meta))) => {
-                        let out = pipeline::PipelineOutput {
-                            frame_id: 0,
-                            jpeg,
-                            meta,
-                            stage_ms: pipeline::StageTimings::default(),
-                        };
-                        if send_live_result(&mut sender, &mut recording, recording_active, out)
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        error!("live inference error: {e:#}");
-                        let _ = sender
-                            .send(Message::Text(
-                                json!({"type":"error","message": e.to_string()})
-                                    .to_string()
-                                    .into(),
-                            ))
-                            .await;
-                    }
-                    Err(e) => error!("live join error: {e}"),
-                }
+                // Overwrite capture slot with newest JPEG (drops stale automatically).
+                state.pipeline.submit_latest(raw);
             }
             _ => {}
         }
     }
+    // Clear so a later session does not inherit stale frames.
+    state.pipeline.clear_pending();
 
     // If client disconnected without stop, still try to finalize.
     if recording_active && recording.frame_count > 0 {
@@ -575,7 +576,7 @@ async fn send_live_result(
         "count": meta.count,
         "recording": recording_active && recording.content_started,
         "recorded_frames": recording.frame_count,
-        "pipeline": false,
+        "pipeline": true,
         "stage_ms": {
             "capture": out.stage_ms.capture_ms,
             "preprocess": out.stage_ms.preprocess_ms,
