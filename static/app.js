@@ -52,6 +52,8 @@
     previewObjectUrl: null,
     liveWarmupLeft: 0,
     busyFrame: false,
+    inFlight: 0,
+    maxInFlight: 2,
     stopping: false,
     expectedFrames: 0,
     processed: 0,
@@ -449,7 +451,8 @@
         );
         setRunningFlags({ running: true });
         // Drop first frames so the export does not begin on a black camera warm-up.
-        state.liveWarmupLeft = 10;
+        state.liveWarmupLeft = 8;
+        state.inFlight = 0;
         els.statusText.textContent = "Live detection · waiting for camera…";
         showPlaceholder(false);
         setRecordingUi(true, 0);
@@ -459,8 +462,12 @@
         const data = JSON.parse(ev.data);
         if (data.type === "result") {
           state.busyFrame = false;
+          state.inFlight = Math.max(0, (state.inFlight || 0) - 1);
           showFrame(data.frame);
           renderResults(data);
+          if (data.pipeline) {
+            els.statusText.textContent = `Live · pipeline · ${data.fps || 0} FPS`;
+          }
         } else if (data.type === "recording_started") {
           setRecordingUi(true, 0);
           els.statusText.textContent = "Live · REC on";
@@ -498,32 +505,48 @@
     const tick = () => {
       if (!state.running || state.stopping || !state.ws || state.ws.readyState !== WebSocket.OPEN)
         return;
-      if (!state.busyFrame) {
-        const video = els.webcam;
-        // Wait until the browser has real camera pixels (not a black 0×0 surface).
-        if (
-          video.readyState >= 2 &&
-          video.videoWidth >= 16 &&
-          video.videoHeight >= 16 &&
-          !video.paused
-        ) {
+      const video = els.webcam;
+      // Limit in-flight frames so we don't flood the server, but never deadlock
+      // waiting for a result before sending the next frame (pipeline is async).
+      const inFlight = state.inFlight || 0;
+      const maxIn = state.maxInFlight || 2;
+      if (
+        inFlight < maxIn &&
+        video.readyState >= 2 &&
+        video.videoWidth >= 16 &&
+        video.videoHeight >= 16 &&
+        !video.paused
+      ) {
+        if (state.liveWarmupLeft > 0) {
+          state.liveWarmupLeft -= 1;
           if (state.liveWarmupLeft > 0) {
-            state.liveWarmupLeft -= 1;
-            // Still draw so the UI can update via detection after warmup.
-            if (state.liveWarmupLeft > 0) {
-              state.loopId = requestAnimationFrame(tick);
-              return;
-            }
-            els.statusText.textContent = "Live detection · recording annotated video";
+            // Draw raw camera to the stage during warm-up so the user sees something.
+            try {
+              const canvas = els.captureCanvas;
+              canvas.width = Math.min(960, video.videoWidth);
+              canvas.height = Math.round(
+                (video.videoHeight * canvas.width) / video.videoWidth
+              );
+              canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+              showFrame(canvas.toDataURL("image/jpeg", 0.7));
+            } catch (_) {}
+            state.loopId = requestAnimationFrame(tick);
+            return;
           }
-          const canvas = els.captureCanvas;
-          const maxW = 960;
-          const scale = Math.min(1, maxW / video.videoWidth);
-          canvas.width = Math.round(video.videoWidth * scale);
-          canvas.height = Math.round(video.videoHeight * scale);
-          const ctx = canvas.getContext("2d");
-          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          // Client-side black check: skip nearly black frames until content appears.
+          els.statusText.textContent = "Live detection · pipeline running";
+        }
+        const canvas = els.captureCanvas;
+        const maxW = 960;
+        const scale = Math.min(1, maxW / video.videoWidth);
+        canvas.width = Math.round(video.videoWidth * scale);
+        canvas.height = Math.round(video.videoHeight * scale);
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        // Soft black skip — only for the first few recorded frames, not forever.
+        // (A strict threshold previously blocked dim rooms / backlit scenes.)
+        let tooDark = false;
+        if ((state.liveWarmupLeft || 0) === 0 && (state.inFlight || 0) === 0) {
           try {
             const sample = ctx.getImageData(
               Math.floor(canvas.width / 4),
@@ -533,22 +556,30 @@
             ).data;
             let sum = 0;
             let n = 0;
-            for (let i = 0; i < sample.length; i += 32) {
+            for (let i = 0; i < sample.length; i += 64) {
               sum += sample[i] + sample[i + 1] + sample[i + 2];
               n += 3;
             }
             const mean = n ? sum / n : 0;
-            if (mean < 12) {
-              state.loopId = requestAnimationFrame(tick);
-              return;
-            }
-          } catch (_) {
-            /* getImageData may fail if canvas is tainted — ignore */
-          }
+            // Only skip pure black frames (sensor not ready).
+            tooDark = mean < 6;
+          } catch (_) {}
+        }
+        if (!tooDark) {
+          state.inFlight = inFlight + 1;
           state.busyFrame = true;
-          state.ws.send(
-            JSON.stringify({ type: "frame", frame: canvas.toDataURL("image/jpeg", 0.72) })
-          );
+          try {
+            state.ws.send(
+              JSON.stringify({ type: "frame", frame: canvas.toDataURL("image/jpeg", 0.72) })
+            );
+          } catch (_) {
+            state.inFlight = Math.max(0, state.inFlight - 1);
+          }
+          // Safety: if a result never arrives, free a slot after 1.5s.
+          setTimeout(() => {
+            if (state.inFlight > 0) state.inFlight = Math.max(0, state.inFlight - 1);
+            state.busyFrame = false;
+          }, 1500);
         }
       }
       state.loopId = requestAnimationFrame(tick);
@@ -700,6 +731,7 @@
     state.running = false;
     state.stopping = false;
     state.busyFrame = false;
+    state.inFlight = 0;
     if (state.loopId) {
       cancelAnimationFrame(state.loopId);
       state.loopId = null;

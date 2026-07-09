@@ -305,6 +305,14 @@ impl DetectionPipeline {
         id
     }
 
+    /// Like `submit_capture`, but reports whether the frame was accepted.
+    pub fn submit_capture_ok(&self, jpeg: Vec<u8>) -> bool {
+        let id = self.frame_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        self.capture_tx
+            .try_send(CaptureMsg::Frame { id, jpeg })
+            .is_ok()
+    }
+
     /// Blocking submit used by sequential-comparison harness (still uses pipeline threads).
     pub fn submit_capture_blocking(&self, jpeg: Vec<u8>) -> u64 {
         let id = self.frame_counter.fetch_add(1, Ordering::Relaxed) + 1;

@@ -401,14 +401,48 @@ async fn handle_live_ws(socket: WebSocket, state: AppState) {
             json!({
                 "type": "recording_started",
                 "job_id": recording.job_id,
-                "message": "Recording annotated live frames"
+                "message": "Recording annotated live frames",
+                "pipeline": true,
             })
             .to_string()
             .into(),
         ))
         .await;
 
-    while let Some(Ok(msg)) = receiver.next().await {
+    // Live loop: accept client frames AND continuously drain the multi-thread
+    // pipeline. Previously we only drained after a new frame message, and the
+    // browser waited for a result before sending the next frame → deadlock.
+    loop {
+        // 1) Drain any completed pipeline outputs first (low latency UI).
+        loop {
+            let Some(out) = state.pipeline.try_recv() else {
+                break;
+            };
+            if send_live_result(&mut sender, &mut recording, recording_active, out)
+                .await
+                .is_err()
+            {
+                recording_active = false;
+                break;
+            }
+        }
+        if !recording_active && recording.frame_count > 0 {
+            // stopped via send error
+            break;
+        }
+
+        // 2) Wait briefly for the next client message so we can keep draining.
+        let msg = match tokio::time::timeout(
+            std::time::Duration::from_millis(8),
+            receiver.next(),
+        )
+        .await
+        {
+            Ok(Some(Ok(m))) => m,
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => continue, // timeout → drain pipeline again
+        };
+
         let text = match msg {
             Message::Text(t) => t.to_string(),
             Message::Close(_) => break,
@@ -439,7 +473,11 @@ async fn handle_live_ws(socket: WebSocket, state: AppState) {
                     .await;
             }
             Some("stop") | Some("record_stop") => {
-                // Finalize annotated MP4 and notify client before socket ends.
+                // Flush remaining pipeline results before finalize.
+                while let Some(out) = state.pipeline.try_recv() {
+                    let _ = send_live_result(&mut sender, &mut recording, recording_active, out)
+                        .await;
+                }
                 if recording_active {
                     let out = finalize_live_recording(&state, &recording).await;
                     let _ = sender
@@ -467,62 +505,51 @@ async fn handle_live_ws(socket: WebSocket, state: AppState) {
                     continue;
                 };
 
-                // Stage 1 input: push into multi-thread pipeline (capture thread).
-                state.pipeline.submit_capture(raw);
-
-                // Drain any completed frames (render thread outputs).
-                while let Some(out) = state.pipeline.try_recv() {
-                    let jpeg = out.jpeg;
-                    let meta = out.meta;
-                    if recording_active {
-                        let black = jpeg_is_mostly_black(&jpeg);
-                        if black {
-                            recording.good_streak = 0;
-                        } else {
-                            recording.good_streak = recording.good_streak.saturating_add(1);
-                        }
-                        if !recording.content_started && recording.good_streak >= 2 {
-                            recording.content_started = true;
-                        }
-                        if recording.content_started && !black {
-                            recording.frame_count += 1;
-                            if meta.fps > 1.0 {
-                                recording.fps =
-                                    0.8 * recording.fps + 0.2 * meta.fps.max(5.0);
-                            }
-                            let fp = recording
-                                .frames_dir
-                                .join(format!("frame_{:06}.jpg", recording.frame_count));
-                            let _ = std::fs::write(&fp, &jpeg);
-                        }
-                    }
-
-                    let frame = format!("data:image/jpeg;base64,{}", B64.encode(&jpeg));
-                    let payload = json!({
-                        "type": "result",
-                        "frame": frame,
-                        "detections": meta.detections,
-                        "summary": meta.summary,
-                        "fps": meta.fps,
-                        "inference_ms": meta.inference_ms,
-                        "device": meta.device,
-                        "count": meta.count,
-                        "recording": recording_active && recording.content_started,
-                        "recorded_frames": recording.frame_count,
-                        "pipeline": true,
-                        "stage_ms": {
-                            "capture": out.stage_ms.capture_ms,
-                            "preprocess": out.stage_ms.preprocess_ms,
-                            "inference": out.stage_ms.inference_ms,
-                            "render": out.stage_ms.render_ms,
-                        }
-                    });
-                    if sender
-                        .send(Message::Text(payload.to_string().into()))
-                        .await
-                        .is_err()
+                // Prefer multi-thread pipeline. If the input queue is full, fall
+                // back to sequential inference so the UI never freezes.
+                if !state.pipeline.submit_capture_ok(raw.clone()) {
+                    let det = state.detector.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        let mut d = det.blocking_lock();
+                        d.predict_jpeg(&raw)
+                    })
+                    .await
                     {
-                        break;
+                        Ok(Ok((jpeg, meta))) => {
+                            let out = pipeline::PipelineOutput {
+                                frame_id: 0,
+                                jpeg,
+                                meta,
+                                stage_ms: pipeline::StageTimings {
+                                    capture_ms: 0.0,
+                                    preprocess_ms: 0.0,
+                                    inference_ms: 0.0,
+                                    render_ms: 0.0,
+                                },
+                            };
+                            if send_live_result(
+                                &mut sender,
+                                &mut recording,
+                                recording_active,
+                                out,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            error!("live sequential inference error: {e:#}");
+                            let _ = sender
+                                .send(Message::Text(
+                                    json!({"type":"error","message": e.to_string()})
+                                        .to_string()
+                                        .into(),
+                                ))
+                                .await;
+                        }
+                        Err(e) => error!("live join error: {e}"),
                     }
                 }
             }
@@ -548,6 +575,64 @@ async fn handle_live_ws(socket: WebSocket, state: AppState) {
     } else if recording.frame_count == 0 {
         let _ = std::fs::remove_dir_all(&recording.frames_dir);
     }
+}
+
+
+async fn send_live_result(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    recording: &mut LiveRecording,
+    recording_active: bool,
+    out: pipeline::PipelineOutput,
+) -> Result<(), ()> {
+    let jpeg = out.jpeg;
+    let meta = out.meta;
+    if recording_active {
+        let black = jpeg_is_mostly_black(&jpeg);
+        if black {
+            recording.good_streak = 0;
+        } else {
+            recording.good_streak = recording.good_streak.saturating_add(1);
+        }
+        // Start recording after first non-black frame (was 2 — too strict with pipeline lag).
+        if !recording.content_started && recording.good_streak >= 1 {
+            recording.content_started = true;
+        }
+        if recording.content_started && !black {
+            recording.frame_count += 1;
+            if meta.fps > 1.0 {
+                recording.fps = 0.8 * recording.fps + 0.2 * meta.fps.max(5.0);
+            }
+            let fp = recording
+                .frames_dir
+                .join(format!("frame_{:06}.jpg", recording.frame_count));
+            let _ = std::fs::write(&fp, &jpeg);
+        }
+    }
+
+    let frame = format!("data:image/jpeg;base64,{}", B64.encode(&jpeg));
+    let payload = json!({
+        "type": "result",
+        "frame": frame,
+        "detections": meta.detections,
+        "summary": meta.summary,
+        "fps": meta.fps,
+        "inference_ms": meta.inference_ms,
+        "device": meta.device,
+        "count": meta.count,
+        "recording": recording_active && recording.content_started,
+        "recorded_frames": recording.frame_count,
+        "pipeline": true,
+        "stage_ms": {
+            "capture": out.stage_ms.capture_ms,
+            "preprocess": out.stage_ms.preprocess_ms,
+            "inference": out.stage_ms.inference_ms,
+            "render": out.stage_ms.render_ms,
+        }
+    });
+    sender
+        .send(Message::Text(payload.to_string().into()))
+        .await
+        .map_err(|_| ())
 }
 
 async fn finalize_live_recording(state: &AppState, rec: &LiveRecording) -> Option<String> {
