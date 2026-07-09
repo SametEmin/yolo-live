@@ -22,6 +22,7 @@ use crate::detector::{
     stage_capture_decode, stage_preprocess, stage_preprocess_fast, stage_render,
     stage_render_fast, Detection, FrameResult, ObjectDetector, PreprocessedFrame,
 };
+use crate::tracker::BoxTracker;
 
 // ─── Latest-frame slot ─────────────────────────────────────────────────────
 
@@ -147,6 +148,8 @@ pub struct DetectionPipeline {
     pre_in: Arc<LatestSlot<PreIn>>,
     inf_in: Arc<LatestSlot<InfIn>>,
     ren_in: Arc<LatestSlot<RenIn>>,
+    /// Signal render thread to reset box smoother (new live session).
+    tracker_reset: Arc<AtomicBool>,
 }
 
 impl DetectionPipeline {
@@ -158,6 +161,7 @@ impl DetectionPipeline {
         let completed = Arc::new(AtomicU64::new(0));
         let sum_infer_ms = Arc::new(AtomicU64::new(0));
         let live_fast = Arc::new(AtomicBool::new(true));
+        let tracker_reset = Arc::new(AtomicBool::new(false));
 
         let cap_in = Arc::new(LatestSlot::<CapIn>::new());
         let pre_in = Arc::new(LatestSlot::<PreIn>::new());
@@ -289,17 +293,22 @@ impl DetectionPipeline {
             let ren_in_t = ren_in.clone();
             let result_t = result_slot.clone();
             let live_fast_t = live_fast.clone();
+            let tracker_reset_t = tracker_reset.clone();
             let mut last_out = Instant::now();
             let mut ema_fps = 0.0f32;
+            let mut tracker = BoxTracker::new();
             joins.push(
                 thread::Builder::new()
                     .name("yolo-render".into())
                     .spawn(move || {
-                        info!("[pipeline] render thread started (latest-frame)");
+                        info!("[pipeline] render thread started (latest-frame + smooth tracker)");
                         while !shut.load(Ordering::Relaxed) {
                             let Some(msg) = ren_in_t.take_wait() else { break };
                             if shut.load(Ordering::Relaxed) {
                                 break;
+                            }
+                            if tracker_reset_t.swap(false, Ordering::Relaxed) {
+                                tracker.reset();
                             }
                             let t0 = Instant::now();
                             let now = Instant::now();
@@ -313,10 +322,12 @@ impl DetectionPipeline {
                                     0.85 * ema_fps + 0.15 * inst
                                 };
                             }
+                            // Mathematical smooth tracking (IoU match + CV-EMA). Cheap vs inference.
+                            let smooth_dets = tracker.update(&msg.detections);
                             let rendered = if live_fast_t.load(Ordering::Relaxed) {
                                 stage_render_fast(
                                     msg.rgb,
-                                    &msg.detections,
+                                    &smooth_dets,
                                     &font,
                                     &device_r,
                                     msg.inference_ms,
@@ -325,7 +336,7 @@ impl DetectionPipeline {
                             } else {
                                 stage_render(
                                     msg.rgb,
-                                    &msg.detections,
+                                    &smooth_dets,
                                     &font,
                                     &device_r,
                                     msg.inference_ms,
@@ -371,6 +382,7 @@ impl DetectionPipeline {
             pre_in,
             inf_in,
             ren_in,
+            tracker_reset,
         })
     }
 
@@ -398,6 +410,8 @@ impl DetectionPipeline {
         self.inf_in.clear();
         self.ren_in.clear();
         self.result_slot.clear();
+        // Reset box smoother so a new live session does not inherit old tracks.
+        self.tracker_reset.store(true, Ordering::Relaxed);
     }
 
     /// Push camera JPEG; always keeps only the **latest** frame (overwrites).

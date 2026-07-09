@@ -3,6 +3,7 @@
 mod coco;
 mod detector;
 mod pipeline;
+mod tracker;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
