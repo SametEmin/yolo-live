@@ -53,7 +53,7 @@
     liveWarmupLeft: 0,
     busyFrame: false,
     inFlight: 0,
-    maxInFlight: 2,
+    maxInFlight: 1,
     stopping: false,
     expectedFrames: 0,
     processed: 0,
@@ -76,8 +76,12 @@
 
   function setMode(mode) {
     if (state.running || state.paused) stopAll(true);
+    // Always tear down any leftover upload/live socket so modes cannot interfere.
+    closeSocket();
+    resetLiveClientState();
     state.mode = mode;
     state.paused = false;
+    state.stopping = false;
     els.btnLive.classList.toggle("active", mode === "live");
     els.btnUpload.classList.toggle("active", mode === "upload");
     els.uploadZone.hidden = mode !== "upload";
@@ -174,6 +178,39 @@
       els.statusText.textContent = "Resuming detection…";
       els.btnResume.disabled = true;
     });
+  }
+
+  function closeSocket() {
+    if (!state.ws) return;
+    try {
+      state.ws.onopen = null;
+      state.ws.onmessage = null;
+      state.ws.onerror = null;
+      state.ws.onclose = null;
+      if (
+        state.ws.readyState === WebSocket.OPEN ||
+        state.ws.readyState === WebSocket.CONNECTING
+      ) {
+        try {
+          state.ws.send(JSON.stringify({ type: "stop" }));
+        } catch (_) {}
+        try {
+          state.ws.close();
+        } catch (_) {}
+      }
+    } catch (_) {}
+    state.ws = null;
+  }
+
+  function resetLiveClientState() {
+    state.busyFrame = false;
+    state.inFlight = 0;
+    state.liveWarmupLeft = 0;
+    state.stopping = false;
+    if (state.loopId) {
+      cancelAnimationFrame(state.loopId);
+      state.loopId = null;
+    }
   }
 
   function setRunningFlags({ running = false, paused = false } = {}) {
@@ -433,9 +470,12 @@
 
   async function startLive() {
     try {
+      closeSocket();
+      resetLiveClientState();
       clearPreviewVideo();
       hideDownload();
       setRecordingUi(false, 0);
+      els.progressBar.hidden = true;
       els.statusText.textContent = "Requesting camera…";
       state.stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
@@ -465,9 +505,7 @@
           state.inFlight = Math.max(0, (state.inFlight || 0) - 1);
           showFrame(data.frame);
           renderResults(data);
-          if (data.pipeline) {
-            els.statusText.textContent = `Live · pipeline · ${data.fps || 0} FPS`;
-          }
+          els.statusText.textContent = `Live · ${Number(data.fps || 0).toFixed(1)} FPS · ${data.count || 0} objects`;
         } else if (data.type === "recording_started") {
           setRecordingUi(true, 0);
           els.statusText.textContent = "Live · REC on";
@@ -533,7 +571,7 @@
             state.loopId = requestAnimationFrame(tick);
             return;
           }
-          els.statusText.textContent = "Live detection · pipeline running";
+          els.statusText.textContent = "Live detection running";
         }
         const canvas = els.captureCanvas;
         const maxW = 960;
@@ -593,6 +631,8 @@
       return;
     }
     try {
+      closeSocket();
+      resetLiveClientState();
       setRunningFlags({ running: true });
       hideDownload();
       setRecordingUi(false, 0);
@@ -704,7 +744,7 @@
             alert(`Processing finished but annotated video was not created.\n${err}`);
           }
           setRunningFlags({ running: false, paused: false });
-          state.ws = null;
+          closeSocket();
         } else if (data.type === "error") {
           els.statusText.textContent = data.message || "Error";
           if (!state.paused) stopAll(true);
@@ -714,7 +754,8 @@
         els.statusText.textContent = "WebSocket error";
       };
       state.ws.onclose = () => {
-        if (state.running && !state.stopping && !state.paused) {
+        // Ignore late close events after we already cleared the socket.
+        if (state.ws && state.running && !state.stopping && !state.paused) {
           setRunningFlags({ running: false, paused: false });
           els.statusText.textContent = "Connection closed";
         }
@@ -741,12 +782,8 @@
       state.stream = null;
     }
     els.webcam.srcObject = null;
-    if (state.ws) {
-      try {
-        state.ws.close();
-      } catch (_) {}
-      state.ws = null;
-    }
+    closeSocket();
+    resetLiveClientState();
     setRunningFlags({ running: false, paused: false });
     setRecordingUi(false, Number(els.recFrames?.textContent || 0));
   }
@@ -805,13 +842,8 @@
       cancelAnimationFrame(state.loopId);
       state.loopId = null;
     }
-    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-      try {
-        state.ws.send(JSON.stringify({ type: "stop" }));
-        state.ws.close();
-      } catch (_) {}
-    }
-    state.ws = null;
+    closeSocket();
+    resetLiveClientState();
     if (state.stream) {
       state.stream.getTracks().forEach((t) => t.stop());
       state.stream = null;
