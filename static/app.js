@@ -450,13 +450,17 @@
     }
     els.instanceList.innerHTML = detections
       .slice(0, 40)
-      .map(
-        (d) => `
+      .map((d) => {
+        const idLabel =
+          d.track_id != null
+            ? `${d.label}_id_${d.track_id}`
+            : d.label;
+        return `
       <div class="instance-row">
-        <span class="name"><span class="swatch" style="background:${d.color}"></span>${escapeHtml(d.label)}</span>
+        <span class="name"><span class="swatch" style="background:${d.color}"></span>${escapeHtml(idLabel)}</span>
         <span class="conf">${(d.confidence * 100).toFixed(0)}%</span>
-      </div>`
-      )
+      </div>`;
+      })
       .join("");
   }
   function clearLabels() {

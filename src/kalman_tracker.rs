@@ -278,7 +278,8 @@ impl KalmanBoxTracker {
             // ~1s at 15 FPS process rate
             max_age: 15,
             max_coast_display: 12,
-            min_hits: 1,
+            // Require 2 hits before showing an ID — fewer false ID flips.
+            min_hits: 2,
             min_conf: 0.35,
             dt: 1.0,
         }
@@ -396,6 +397,7 @@ impl KalmanBoxTracker {
                 confidence: (t.conf * 1000.0).round() / 1000.0,
                 bbox: t.kf.bbox_xyxy(),
                 color: t.color.clone(),
+                track_id: Some(t.id),
             });
         }
         out

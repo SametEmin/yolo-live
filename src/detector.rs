@@ -32,6 +32,39 @@ pub struct Detection {
     pub confidence: f32,
     pub bbox: [f32; 4],
     pub color: String,
+    /// Stable track id from the tracker (None for raw untracked detections).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track_id: Option<u64>,
+}
+
+impl Detection {
+    /// Folder / display key: `person_id_3`, `car_id_1`.
+    pub fn track_key(&self) -> String {
+        let safe = sanitize_label(&self.label);
+        match self.track_id {
+            Some(id) => format!("{safe}_id_{id}"),
+            None => safe,
+        }
+    }
+}
+
+fn sanitize_label(label: &str) -> String {
+    let s: String = label
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let s = s.trim_matches('_').to_string();
+    if s.is_empty() {
+        "object".into()
+    } else {
+        s
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -156,6 +189,30 @@ impl ObjectDetector {
         &self.font
     }
 
+
+
+    /// Upload path: decode → infer → Kalman-style smooth callback → render.
+    /// Returns (annotated_jpeg, meta, original_rgb, smoothed_dets).
+    pub fn process_frame_for_upload(
+        &mut self,
+        jpeg_bytes: &[u8],
+        smooth: impl FnOnce(Vec<Detection>) -> Vec<Detection>,
+    ) -> Result<(Vec<u8>, FrameResult, RgbImage, Vec<Detection>)> {
+        let rgb = stage_capture_decode(jpeg_bytes)?;
+        let prepared = stage_preprocess(rgb);
+        let (dets, inference_ms) = self.stage_inference(&prepared)?;
+        self.note_fps();
+        let smoothed = smooth(dets);
+        let (jpeg, meta) = stage_render(
+            prepared.rgb.clone(),
+            &smoothed,
+            &self.font,
+            &self.device,
+            inference_ms,
+            self.fps,
+        )?;
+        Ok((jpeg, meta, prepared.rgb, smoothed))
+    }
 
     /// Infer then apply external track smoother before drawing.
     pub fn predict_jpeg_smoothed(
@@ -490,6 +547,7 @@ fn postprocess(
                 y2 / orig_h as f32,
             ],
             color: coco::hex_color(cls),
+            track_id: None,
         });
     }
     Ok(out)
@@ -571,7 +629,10 @@ fn draw_detections(img: &mut RgbImage, dets: &[Detection], font: &FontArc) {
             }
         }
 
-        let text = format!("{} {:.0}%", d.label, d.confidence * 100.0);
+        let text = match d.track_id {
+            Some(id) => format!("{}_id_{} {:.0}%", d.label, id, d.confidence * 100.0),
+            None => format!("{} {:.0}%", d.label, d.confidence * 100.0),
+        };
         let tx = x1.max(0);
         let ty = (y1 - (scale.y as i32) - 4).max(0);
         let tw = ((text.len() as f32) * scale.x * 0.55) as u32 + 8;

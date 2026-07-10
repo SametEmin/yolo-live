@@ -823,11 +823,15 @@ async fn handle_video_ws(socket: WebSocket, state: AppState, job_id: String) {
     };
 
     let frames_dir = state.root.join("outputs").join(format!("{job_id}_frames"));
+    let objects_root = state.root.join("outputs").join(&job_id).join("objects");
     // Fresh session: clear any leftover frames for this job id.
     let _ = std::fs::remove_dir_all(&frames_dir);
+    let _ = std::fs::remove_dir_all(state.root.join("outputs").join(&job_id));
     let _ = std::fs::create_dir_all(&frames_dir);
+    let _ = std::fs::create_dir_all(&objects_root);
     let mut processed: u64 = 0;
     // Kalman multi-object tracker: keeps boxes on the same object through brief misses.
+    // IDs are permanent for the job (never reused) → accurate person_id_3 / car_id_1 folders.
     let mut kalman = KalmanBoxTracker::new();
     {
         let conf = state.detector.lock().await.confidence();
@@ -1025,24 +1029,33 @@ async fn handle_video_ws(socket: WebSocket, state: AppState, job_id: String) {
                 let conf_now = state.detector.lock().await.confidence();
                 kalman.set_min_conf(conf_now);
 
-                // Share Kalman tracker with the blocking thread for this frame only:
-                // we update on the async side after raw inference via smoothed helper.
-                let kalman_cell = std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(&mut kalman)));
+                let kalman_cell =
+                    std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(&mut kalman)));
                 let kalman_b = kalman_cell.clone();
+                let objects_root_clone = objects_root.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     let mut d = det.blocking_lock();
                     let mut tr = kalman_b.lock().unwrap();
-                    d.predict_jpeg_smoothed(&jpeg_clone, |dets| tr.update(dets))
+                    d.process_frame_for_upload(&jpeg_clone, |dets| tr.update(&dets))
                 })
                 .await;
-                // Restore tracker for the next frame (spawn finished → unique Arc).
                 kalman = std::sync::Arc::try_unwrap(kalman_cell)
                     .map(|m| m.into_inner().unwrap_or_default())
-                    .unwrap_or_else(|arc| arc.lock().map(|g| g.clone()).unwrap_or_default());
+                    .unwrap_or_else(|arc| {
+                        arc.lock().map(|g| g.clone()).unwrap_or_default()
+                    });
 
                 match result {
-                    Ok(Ok((out_jpeg, meta_out))) => {
+                    Ok(Ok((out_jpeg, meta_out, rgb_orig, smooth_dets))) => {
                         processed += 1;
+                        // Save crops: outputs/{job_id}/objects/person_id_3/frame_000012.jpg
+                        save_tracked_crops(
+                            &objects_root_clone,
+                            &rgb_orig,
+                            &smooth_dets,
+                            processed,
+                        );
+
                         let fp = frames_dir.join(format!("frame_{:06}.jpg", processed));
                         let _ = std::fs::write(&fp, &out_jpeg);
 
@@ -1063,6 +1076,7 @@ async fn handle_video_ws(socket: WebSocket, state: AppState, job_id: String) {
                             "progress": progress,
                             "partial": true,
                             "tracker": "kalman",
+                            "objects_dir": format!("outputs/{job_id}/objects"),
                         });
                         if sender
                             .send(Message::Text(payload.to_string().into()))
@@ -1208,6 +1222,9 @@ async fn handle_video_ws(socket: WebSocket, state: AppState, job_id: String) {
             }
         }
     }
+
+    // Write object-id manifest for this job
+    write_objects_manifest(&objects_root, &job_id);
 
     // Final assembly (partial or complete)
     let mut output_url = last_export_url;
@@ -1488,4 +1505,118 @@ fn probe_video_meta(path: &Path) -> VideoMeta {
 fn probe_video(path: &Path) -> (f64, u64, u32, u32) {
     let m = probe_video_meta(path);
     (m.fps, m.frames, m.width, m.height)
+}
+
+
+/// Save object crops under `objects/{label}_id_{n}/frame_XXXXXX.jpg`.
+fn save_tracked_crops(
+    objects_root: &Path,
+    frame_bgr_or_rgb: &image::RgbImage,
+    detections: &[detector::Detection],
+    frame_index: u64,
+) {
+    let (fw, fh) = frame_bgr_or_rgb.dimensions();
+    for d in detections {
+        let Some(tid) = d.track_id else { continue };
+        let key = d.track_key(); // e.g. person_id_3
+        let dir = objects_root.join(&key);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let x1 = ((d.bbox[0] * fw as f32).floor() as u32).min(fw.saturating_sub(1));
+        let y1 = ((d.bbox[1] * fh as f32).floor() as u32).min(fh.saturating_sub(1));
+        let x2 = ((d.bbox[2] * fw as f32).ceil() as u32).clamp(x1 + 1, fw);
+        let y2 = ((d.bbox[3] * fh as f32).ceil() as u32).clamp(y1 + 1, fh);
+        let cw = x2 - x1;
+        let ch = y2 - y1;
+        if cw < 2 || ch < 2 {
+            continue;
+        }
+        let crop = image::imageops::crop_imm(frame_bgr_or_rgb, x1, y1, cw, ch).to_image();
+        let out = dir.join(format!("frame_{frame_index:06}.jpg"));
+        let _ = crop.save(&out);
+
+        // Keep a rolling "best" crop (highest conf) as best.jpg
+        let best_path = dir.join("best.jpg");
+        let meta_path = dir.join("meta.json");
+        let mut should_write_best = !best_path.exists();
+        if meta_path.exists() {
+            if let Ok(txt) = std::fs::read_to_string(&meta_path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                    let prev = v.get("best_confidence").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    if d.confidence as f64 > prev {
+                        should_write_best = true;
+                    }
+                }
+            }
+        } else {
+            should_write_best = true;
+        }
+        if should_write_best {
+            let _ = crop.save(&best_path);
+            let _ = std::fs::write(
+                &meta_path,
+                serde_json::json!({
+                    "track_key": key,
+                    "label": d.label,
+                    "track_id": tid,
+                    "best_confidence": d.confidence,
+                    "best_frame": frame_index,
+                })
+                .to_string(),
+            );
+        }
+    }
+}
+
+fn write_objects_manifest(objects_root: &Path, job_id: &str) {
+    let mut entries = Vec::new();
+    let Ok(rd) = std::fs::read_dir(objects_root) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let path = e.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().to_string();
+        let meta_path = path.join("meta.json");
+        let meta = std::fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+        let n_crops = std::fs::read_dir(&path)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|f| {
+                        f.path()
+                            .extension()
+                            .and_then(|x| x.to_str())
+                            .map(|x| x.eq_ignore_ascii_case("jpg"))
+                            .unwrap_or(false)
+                            && f.file_name() != "best.jpg"
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        entries.push(serde_json::json!({
+            "track_key": name,
+            "crop_count": n_crops,
+            "meta": meta,
+            "path": format!("objects/{name}"),
+        }));
+    }
+    entries.sort_by(|a, b| {
+        a.get("track_key")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .cmp(b.get("track_key").and_then(|x| x.as_str()).unwrap_or(""))
+    });
+    let manifest = serde_json::json!({
+        "job_id": job_id,
+        "object_count": entries.len(),
+        "objects": entries,
+    });
+    let _ = std::fs::write(
+        objects_root.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap_or_else(|_| "{}".into()),
+    );
 }

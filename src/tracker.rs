@@ -176,6 +176,7 @@ impl BoxTracker {
                 confidence: (t.conf * 1000.0).round() / 1000.0,
                 bbox: t.bbox,
                 color: t.color.clone(),
+                track_id: Some(t.id),
             });
         }
         out
