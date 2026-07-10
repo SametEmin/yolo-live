@@ -3,10 +3,11 @@
 //! Pipeline (very cheap, does not affect inference FPS):
 //! 1. Predict each track with constant-velocity model
 //! 2. Associate detections ↔ tracks by label + IoU (greedy)
-//! 3. Update matched tracks with EMA blended measurement + prediction
-//! 4. Coast unmatched tracks briefly; spawn new tracks for new detections
+//! 3. Update matched tracks with EMA on geometry only
+//! 4. Coast unmatched tracks briefly for smooth motion (bbox only)
 //!
-//! This removes jittery box jumps between frames while keeping full throughput.
+//! Confidence is never artificially lowered: we keep the last real
+//! detector score and hide anything below the configured threshold.
 
 use crate::detector::Detection;
 
@@ -19,6 +20,7 @@ struct Track {
     bbox: [f32; 4],
     /// Velocity of xyxy per frame
     vel: [f32; 4],
+    /// Last *real* detector confidence (never decayed for display)
     conf: f32,
     /// Frames since last successful match
     time_since_update: u32,
@@ -31,17 +33,16 @@ struct Track {
 pub struct BoxTracker {
     tracks: Vec<Track>,
     next_id: u64,
-    /// Measurement blend for center (0 = pure predict/smooth, 1 = pure measure)
     alpha_center: f32,
-    /// Measurement blend for size
     alpha_size: f32,
-    /// Velocity EMA
     alpha_vel: f32,
     iou_thresh: f32,
-    /// Keep coasting after miss
     max_age: u32,
-    /// Min hits before emitting a box (reduces flicker of one-frame FPs)
     min_hits: u32,
+    /// Do not emit boxes below this confidence (matches detector threshold).
+    min_conf: f32,
+    /// Only coast (show without a new detection) this many frames.
+    max_coast_display: u32,
 }
 
 impl Default for BoxTracker {
@@ -55,15 +56,19 @@ impl BoxTracker {
         Self {
             tracks: Vec::with_capacity(32),
             next_id: 1,
-            // Tuned for smooth live boxes without rubber-banding lag
-            // Lower alpha => smoother (less jitter), still responsive.
             alpha_center: 0.28,
             alpha_size: 0.32,
             alpha_vel: 0.40,
             iou_thresh: 0.12,
-            max_age: 10,
+            max_age: 8,
             min_hits: 1,
+            min_conf: 0.35,
+            max_coast_display: 2,
         }
+    }
+
+    pub fn set_min_conf(&mut self, min_conf: f32) {
+        self.min_conf = min_conf.clamp(0.05, 0.95);
     }
 
     pub fn reset(&mut self) {
@@ -73,12 +78,17 @@ impl BoxTracker {
 
     /// Update tracker with raw detections; returns smoothed boxes to draw.
     pub fn update(&mut self, detections: &[Detection]) -> Vec<Detection> {
+        // Drop any measurement already below threshold (safety).
+        let detections: Vec<&Detection> = detections
+            .iter()
+            .filter(|d| d.confidence + 1e-6 >= self.min_conf)
+            .collect();
+
         // 1) Predict
         for t in &mut self.tracks {
             for i in 0..4 {
                 t.bbox[i] = (t.bbox[i] + t.vel[i]).clamp(0.0, 1.0);
             }
-            // Keep box ordered
             if t.bbox[0] > t.bbox[2] {
                 t.bbox.swap(0, 2);
             }
@@ -95,7 +105,6 @@ impl BoxTracker {
         let mut det_used = vec![false; n_det];
         let mut trk_used = vec![false; n_trk];
 
-        // Build candidate pairs
         let mut pairs: Vec<(f32, usize, usize)> = Vec::new();
         for (ti, t) in self.tracks.iter().enumerate() {
             for (di, d) in detections.iter().enumerate() {
@@ -106,7 +115,6 @@ impl BoxTracker {
                 if iou >= self.iou_thresh {
                     pairs.push((iou, ti, di));
                 } else {
-                    // Also allow center-distance match for fast motion / low IoU
                     let dist = center_dist(&t.bbox, &d.bbox);
                     if dist < 0.12 {
                         pairs.push((0.05 + (0.12 - dist), ti, di));
@@ -122,7 +130,7 @@ impl BoxTracker {
             }
             trk_used[ti] = true;
             det_used[di] = true;
-            self.apply_measurement(ti, &detections[di]);
+            self.apply_measurement(ti, detections[di]);
         }
 
         // 3) New tracks for unmatched detections
@@ -149,24 +157,23 @@ impl BoxTracker {
         self.tracks
             .retain(|t| t.time_since_update <= self.max_age);
 
-        // 5) Emit active tracks (matched recently or confirmed)
+        // 5) Emit only high-confidence tracks
         let mut out = Vec::with_capacity(self.tracks.len());
         for t in &self.tracks {
-            // Show if recently updated, or still coasting with enough history
+            // Never show below the detector confidence threshold.
+            if t.conf + 1e-6 < self.min_conf {
+                continue;
+            }
+            // Prefer freshly matched tracks; coast only briefly for smooth motion.
             let visible = t.hits >= self.min_hits
-                && (t.time_since_update <= 3 || t.hits >= 3);
+                && t.time_since_update <= self.max_coast_display;
             if !visible {
                 continue;
             }
-            // Confidence fades slightly while coasting
-            let conf = if t.time_since_update == 0 {
-                t.conf
-            } else {
-                (t.conf * (1.0 - 0.08 * t.time_since_update as f32)).max(0.15)
-            };
             out.push(Detection {
                 label: t.label.clone(),
-                confidence: (conf * 1000.0).round() / 1000.0,
+                // Always show last real detector confidence (no artificial decay).
+                confidence: (t.conf * 1000.0).round() / 1000.0,
                 bbox: t.bbox,
                 color: t.color.clone(),
             });
@@ -179,11 +186,9 @@ impl BoxTracker {
         let prev = t.bbox;
         let meas = d.bbox;
 
-        // Convert to center/size for more natural smoothing
         let (pcx, pcy, pw, ph) = xyxy_to_cxcywh(prev);
         let (mcx, mcy, mw, mh) = xyxy_to_cxcywh(meas);
 
-        // Predicted center already advanced in predict step; blend measurement
         let ac = self.alpha_center;
         let asz = self.alpha_size;
         let cx = (1.0 - ac) * pcx + ac * mcx;
@@ -193,17 +198,19 @@ impl BoxTracker {
 
         let new_bbox = cxcywh_to_xyxy(cx, cy, w, h);
 
-        // Velocity update from measurement residual
         let av = self.alpha_vel;
         for i in 0..4 {
             let meas_vel = meas[i] - prev[i];
             t.vel[i] = (1.0 - av) * t.vel[i] + av * meas_vel;
-            // Dampen velocity to avoid overshoot
             t.vel[i] *= 0.85;
         }
 
         t.bbox = new_bbox;
-        t.conf = 0.6 * t.conf + 0.4 * d.confidence;
+        // Keep the stronger of EMA and the new measurement so scores do not
+        // get pulled down by a single weaker frame after a strong one.
+        // Also never store below min_conf (measurements are already filtered).
+        let blended = 0.3 * t.conf + 0.7 * d.confidence;
+        t.conf = blended.max(d.confidence).max(self.min_conf);
         t.color = d.color.clone();
         t.time_since_update = 0;
         t.hits = t.hits.saturating_add(1);

@@ -294,6 +294,7 @@ impl DetectionPipeline {
             let result_t = result_slot.clone();
             let live_fast_t = live_fast.clone();
             let tracker_reset_t = tracker_reset.clone();
+            let conf_bits_render = conf_bits.clone();
             let mut last_out = Instant::now();
             let mut ema_fps = 0.0f32;
             let mut tracker = BoxTracker::new();
@@ -310,6 +311,9 @@ impl DetectionPipeline {
                             if tracker_reset_t.swap(false, Ordering::Relaxed) {
                                 tracker.reset();
                             }
+                            // Keep display threshold in sync with UI confidence slider.
+                            let min_c = f32::from_bits(conf_bits_render.load(Ordering::Relaxed));
+                            tracker.set_min_conf(min_c);
                             let t0 = Instant::now();
                             let now = Instant::now();
                             let dt = now.duration_since(last_out).as_secs_f32();
