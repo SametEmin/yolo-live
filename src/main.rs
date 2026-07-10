@@ -4,6 +4,7 @@ mod coco;
 mod detector;
 mod pipeline;
 mod tracker;
+mod kalman_tracker;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -21,6 +22,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use detector::ObjectDetector;
 use pipeline::{run_benchmark, DetectionPipeline};
+use kalman_tracker::KalmanBoxTracker;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
@@ -825,11 +827,19 @@ async fn handle_video_ws(socket: WebSocket, state: AppState, job_id: String) {
     let _ = std::fs::remove_dir_all(&frames_dir);
     let _ = std::fs::create_dir_all(&frames_dir);
     let mut processed: u64 = 0;
+    // Kalman multi-object tracker: keeps boxes on the same object through brief misses.
+    let mut kalman = KalmanBoxTracker::new();
+    {
+        let conf = state.detector.lock().await.confidence();
+        kalman.set_min_conf(conf);
+    }
+    kalman.set_dt(1.0);
 
     let _ = sender
         .send(Message::Text(
             json!({
                 "type": "start",
+                "tracker": "kalman",
                 "total_source_frames": meta.frames,
                 "src_fps": meta.fps,
                 "process_fps": process_fps,
@@ -1012,11 +1022,23 @@ async fn handle_video_ws(socket: WebSocket, state: AppState, job_id: String) {
 
                 let det = state.detector.clone();
                 let jpeg_clone = jpeg.clone();
+                let conf_now = state.detector.lock().await.confidence();
+                kalman.set_min_conf(conf_now);
+
+                // Share Kalman tracker with the blocking thread for this frame only:
+                // we update on the async side after raw inference via smoothed helper.
+                let kalman_cell = std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(&mut kalman)));
+                let kalman_b = kalman_cell.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     let mut d = det.blocking_lock();
-                    d.predict_jpeg(&jpeg_clone)
+                    let mut tr = kalman_b.lock().unwrap();
+                    d.predict_jpeg_smoothed(&jpeg_clone, |dets| tr.update(dets))
                 })
                 .await;
+                // Restore tracker for the next frame (spawn finished → unique Arc).
+                kalman = std::sync::Arc::try_unwrap(kalman_cell)
+                    .map(|m| m.into_inner().unwrap_or_default())
+                    .unwrap_or_else(|arc| arc.lock().map(|g| g.clone()).unwrap_or_default());
 
                 match result {
                     Ok(Ok((out_jpeg, meta_out))) => {
@@ -1040,6 +1062,7 @@ async fn handle_video_ws(socket: WebSocket, state: AppState, job_id: String) {
                             "expected_frames": expected_frames,
                             "progress": progress,
                             "partial": true,
+                            "tracker": "kalman",
                         });
                         if sender
                             .send(Message::Text(payload.to_string().into()))

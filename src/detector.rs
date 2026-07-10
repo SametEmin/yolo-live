@@ -156,6 +156,28 @@ impl ObjectDetector {
         &self.font
     }
 
+
+    /// Infer then apply external track smoother before drawing.
+    pub fn predict_jpeg_smoothed(
+        &mut self,
+        jpeg_bytes: &[u8],
+        smooth: impl FnOnce(&[Detection]) -> Vec<Detection>,
+    ) -> Result<(Vec<u8>, FrameResult)> {
+        let rgb = stage_capture_decode(jpeg_bytes)?;
+        let prepared = stage_preprocess(rgb);
+        let (dets, inference_ms) = self.stage_inference(&prepared)?;
+        self.note_fps();
+        let smoothed = smooth(&dets);
+        stage_render(
+            prepared.rgb,
+            &smoothed,
+            &self.font,
+            &self.device,
+            inference_ms,
+            self.fps,
+        )
+    }
+
     /// Single-threaded end-to-end (baseline): capture → preprocess → infer → render.
     pub fn predict_jpeg(&mut self, jpeg_bytes: &[u8]) -> Result<(Vec<u8>, FrameResult)> {
         let rgb = stage_capture_decode(jpeg_bytes)?;
